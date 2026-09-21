@@ -8,7 +8,7 @@ import anyio
 from pydantic import BaseModel
 import pytest
 
-from warpweft.core.axes import ScopeSpec
+from warpweft.core.axes import AxisRegistry, ScopeSpec
 from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Registry
 from warpweft.core.errors import ConfigurationError, DeadlineExceeded, TransientError
@@ -291,6 +291,13 @@ async def test_required_axis_without_a_value_errors_on_use() -> None:
             await app.get(PerTenant)
 
 
+def test_app_axis_passes_max_cardinality() -> None:
+    axes = AxisRegistry()
+    app = App(registry=Registry(), axes=axes)
+    app.axis("tenant", default="public", max_cardinality=5)
+    assert axes.get("tenant").max_cardinality == 5
+
+
 # --- budget & correlation ----------------------------------------------------
 
 
@@ -304,6 +311,22 @@ async def test_budget_passthrough_on_invoke_and_proxy() -> None:
             await app.invoke("flaky", "fetch", budget=0.05)
         with pytest.raises(DeadlineExceeded):
             await app.proxy(Flaky, budget=0.05).fetch()
+
+
+# --- breaker controls --------------------------------------------------------
+
+
+async def test_breaker_controls_passthrough() -> None:
+    registry = Registry()
+    registry.register(Greeter)
+    config = {"greeter": {"policy": {"circuit_breaker": {"window": 3, "failure_threshold": 3, "reset_timeout": 10.0}}}}
+    app = App(registry=registry, config=config)
+    async with app.run():
+        await app.invoke("greeter", "greet", whom="world")  # materialise the breaker
+        assert await app.force_open_breakers() == 1
+        assert app.container.snapshot().breakers[0].state == "open"
+        assert await app.reset_breakers() == 1
+        assert app.container.snapshot().breakers[0].state == "closed"
 
 
 async def test_correlation_helper_binds_the_ambient_id() -> None:

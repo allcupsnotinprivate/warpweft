@@ -8,7 +8,7 @@ from warpweft.core.axes import Axis, AxisRegistry, ScopeSpec
 from warpweft.core.component import AComponent, EmptySettings, Lifetime, Policy, invocable
 from warpweft.core.composition import Container, DictSettingsResolver, Registry
 from warpweft.core.composition.config import SOURCE_COMPONENT, SOURCE_DEPLOYMENT, SOURCE_FRAMEWORK, SOURCE_SLICE
-from warpweft.core.errors import ConfigurationError
+from warpweft.core.errors import CircuitOpen, ConfigurationError
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -186,6 +186,43 @@ async def test_snapshot_reports_breaker_and_concurrency_state() -> None:
     assert conc.outer_limit == 3
     assert conc.outer_available == 3  # the call completed, slots released
     assert conc.inner_slices >= 1
+    await container.stop()
+
+
+def _guarded_breaker_config() -> dict[str, object]:
+    return {"guarded": {"policy": {"circuit_breaker": {"window": 5, "failure_threshold": 5, "reset_timeout": 10.0}}}}
+
+
+async def test_force_open_and_reset_breakers() -> None:
+    reg = Registry()
+    reg.register(Guarded)
+    container = Container.build(reg, _guarded_breaker_config())
+    await container.start()
+    await container.invoke("guarded", "go")  # materialise the breaker
+
+    assert await container.force_open_breakers(endpoint="host-x") == 1
+    assert container.snapshot().breakers[0].state == "open"
+    with pytest.raises(CircuitOpen):
+        await container.invoke("guarded", "go")  # open breaker rejects
+
+    assert await container.reset_breakers() == 1  # no filter -> every live breaker
+    assert container.snapshot().breakers[0].state == "closed"
+    assert (await container.invoke("guarded", "go")).value == "ok"  # closed again
+    await container.stop()
+
+
+async def test_breaker_controls_return_zero_when_nothing_matches() -> None:
+    reg = Registry()
+    reg.register(Guarded)
+    container = Container.build(reg, _guarded_breaker_config())
+    await container.start()
+
+    # No call yet: the breaker is created lazily, so nothing is live.
+    assert await container.force_open_breakers() == 0
+    assert await container.reset_breakers() == 0
+
+    await container.invoke("guarded", "go")  # now the breaker exists
+    assert await container.force_open_breakers(endpoint="other") == 0  # wrong slice
     await container.stop()
 
 

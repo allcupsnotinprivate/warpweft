@@ -550,6 +550,39 @@ class Container:
         live_slices = {name: tuple(store.keys()) for name, store in self._scoped_stores.items()}
         return RuntimeSnapshot(tuple(breakers), tuple(concurrency), live_slices)
 
+    def _live_breakers(self, endpoint: str | None) -> list[CircuitBreakerInterceptor]:
+        """Live breaker instances, optionally filtered to one endpoint slice."""
+        return [
+            instance
+            for key, instance in self._link_store.items()
+            if isinstance(instance, CircuitBreakerInterceptor)
+            and (endpoint is None or ("endpoint", endpoint) in key[1:])
+        ]
+
+    async def force_open_breakers(self, *, endpoint: str | None = None) -> int:
+        """Manually open matching live breakers; return how many were flipped.
+
+        Breakers are created lazily on the first guarded call, so ``0`` means
+        none are live yet. With ``endpoint`` set only that slice's breaker is
+        touched; otherwise every live breaker is. Manual transitions are logged
+        but emit no transition metric.
+        """
+        breakers = self._live_breakers(endpoint)
+        for breaker in breakers:
+            await breaker.force_open()
+        return len(breakers)
+
+    async def reset_breakers(self, *, endpoint: str | None = None) -> int:
+        """Manually close matching live breakers, clearing their windows.
+
+        Returns how many were reset; ``0`` when none match (see
+        `force_open_breakers` for the endpoint filter and laziness).
+        """
+        breakers = self._live_breakers(endpoint)
+        for breaker in breakers:
+            await breaker.reset()
+        return len(breakers)
+
     @property
     def started(self) -> bool:
         return self._started
