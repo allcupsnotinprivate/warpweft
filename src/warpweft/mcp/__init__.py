@@ -13,24 +13,36 @@ from .tool import ToolMeta, is_tool, tool
 
 if TYPE_CHECKING:
     from .server import ToolBinding, build_server, collect_tools, run_stdio
+    from .tasks import InMemoryTaskStore, TaskRecord, TaskRunner, TaskStore, task_runner
 
 __all__ = [
+    "InMemoryTaskStore",
+    "TaskRecord",
+    "TaskRunner",
+    "TaskStore",
     "ToolBinding",
     "ToolMeta",
     "build_server",
     "collect_tools",
     "is_tool",
     "run_stdio",
+    "task_runner",
     "tool",
 ]
 
 #: Names served lazily from ``.server`` (which imports the mcp SDK).
-_LAZY = frozenset({"ToolBinding", "build_server", "collect_tools", "run_stdio"})
+_LAZY_SERVER = frozenset({"ToolBinding", "build_server", "collect_tools", "run_stdio"})
+#: Names served lazily from ``.tasks`` (which imports the mcp SDK).
+_LAZY_TASKS = frozenset({"InMemoryTaskStore", "TaskRecord", "TaskRunner", "TaskStore", "task_runner"})
 
 
 def __getattr__(name: str) -> Any:
-    if name in _LAZY:
+    if name in _LAZY_SERVER:
         from . import server
 
         return getattr(server, name)
+    if name in _LAZY_TASKS:
+        from . import tasks
+
+        return getattr(tasks, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
