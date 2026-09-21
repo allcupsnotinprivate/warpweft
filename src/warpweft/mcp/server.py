@@ -11,7 +11,7 @@ telemetry; the result is serialized against the invocable's output schema
 (secrets masked) and returned as both structured and text content.
 """
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 import contextlib
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -27,12 +27,18 @@ from pydantic import ValidationError
 from warpweft.core.component import InvocableSpec, describe
 from warpweft.core.context import use_progress_sink
 from warpweft.core.errors import FrameworkError
-from warpweft.runtime import App
+from warpweft.runtime import App, AxisHandle
 
 from .errors import error_result
 from .schema import tool_input_schema
 from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRunner, TaskStatusView, status_view, task_runner
 from .tool import ToolMeta, is_tool, tool_meta
+
+#: Derives an axis value (e.g. tenant) from the incoming MCP call - the request
+#: context (``ctx``: session, headers, ``_meta``) and the call params (name,
+#: arguments). Returning ``None`` leaves the axis unbound (its default/required
+#: rule then applies). Bound around the call so scoped components resolve.
+AxisBinder = Callable[[Any, mt.CallToolRequestParams], str | None]
 
 #: Names of the shared built-in tools that drive background execution. They are
 #: reserved: a component tool may not claim one (checked at build time).
@@ -376,6 +382,19 @@ async def _confirm_destructive(ctx: Any, binding: ToolBinding) -> mt.CallToolRes
     return None
 
 
+def _bind_axes(
+    stack: contextlib.ExitStack,
+    binders: Mapping[AxisHandle, AxisBinder],
+    ctx: Any,
+    params: mt.CallToolRequestParams,
+) -> None:
+    """Enter each axis binding whose binder yields a value for this call."""
+    for handle, binder in binders.items():
+        value = binder(ctx, params)
+        if value is not None:
+            stack.enter_context(handle.use(value))
+
+
 def build_server(
     app: App,
     *,
@@ -386,6 +405,7 @@ def build_server(
     exclude: Collection[str] | None = None,
     confirm_destructive: bool = False,
     runner: TaskRunner | None = None,
+    axis_binders: Mapping[AxisHandle, AxisBinder] | None = None,
 ) -> Server[Any]:
     """Wire an MCP server exposing the app's tools. The app must be started.
 
@@ -404,7 +424,17 @@ def build_server(
     background tool without a ``runner`` is a `FrameworkError` - the advertised
     behaviour must be real. Everything here is plain ``tools/call``, so it needs
     no special transport.
+
+    ``axis_binders`` maps a state-slicing `AxisHandle` (from ``app.axis(...)``)
+    to a function that derives its value from each call - e.g. a ``tenant`` axis
+    bound from an ``x-tenant`` header or the auth context. Each call binds the
+    axis (via the handle's contextvar) around ``invoke`` so scoped components
+    resolve; for a background submit the binding spans ``runner.start`` so the
+    job inherits it. A binder returning ``None`` leaves the axis to its
+    default/required rule. Without this, an axis value must be bound by the host
+    (e.g. ASGI middleware) instead.
     """
+    binders = dict(axis_binders or {})
     bindings = {b.name: b for b in collect_tools(app, tags=tags, include=include, exclude=exclude)}
     classes = {name: app.registry.get(name) for name in app.registry.names()}
 
@@ -450,26 +480,37 @@ def build_server(
             if denial is not None:
                 return denial
 
-        if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
-            return await _submit(app, runner, binding, kwargs)
+        # Bind request-derived axis values (e.g. tenant) for the duration of the
+        # call. For a background submit the binding must span runner.start so
+        # start_soon captures it into the job's context; for an inline call it
+        # must span the invoke. A binder that raises is a tool error, never a
+        # transport-level failure.
+        with contextlib.ExitStack() as axes:
+            try:
+                _bind_axes(axes, binders, ctx, params)
+            except Exception as exc:
+                return error_result(exc)
 
-        async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
-            # Best-effort: a failed notification must never fail the call.
-            # The session no-ops by itself when the client sent no token.
-            with contextlib.suppress(Exception):
-                await ctx.session.report_progress(progress, total, message)
+            if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
+                return await _submit(app, runner, binding, kwargs)
 
-        # Any failure - framework or user code - becomes a tool error with retry
-        # guidance, never a transport-level failure. Cancellation (a
-        # BaseException) still propagates: the SDK cancels this handler's anyio
-        # scope on notifications/cancelled, which unwinds the policy chain.
-        try:
-            with use_progress_sink(forward_progress):
-                outcome = await app.container.invoke(binding.component, binding.method, **kwargs)
-        except Exception as exc:
-            return error_result(exc)
+            async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
+                # Best-effort: a failed notification must never fail the call.
+                # The session no-ops by itself when the client sent no token.
+                with contextlib.suppress(Exception):
+                    await ctx.session.report_progress(progress, total, message)
 
-        return _success_result(binding, outcome)
+            # Any failure - framework or user code - becomes a tool error with
+            # retry guidance, never a transport-level failure. Cancellation (a
+            # BaseException) still propagates: the SDK cancels this handler's
+            # anyio scope on notifications/cancelled, unwinding the policy chain.
+            try:
+                with use_progress_sink(forward_progress):
+                    outcome = await app.container.invoke(binding.component, binding.method, **kwargs)
+            except Exception as exc:
+                return error_result(exc)
+
+            return _success_result(binding, outcome)
 
     return Server(name, version=version, on_list_tools=on_list_tools, on_call_tool=on_call_tool)
 
@@ -546,12 +587,14 @@ async def run_stdio(
     exclude: Collection[str] | None = None,
     confirm_destructive: bool = False,
     background: bool = True,
+    axis_binders: Mapping[AxisHandle, AxisBinder] | None = None,
 ) -> None:  # pragma: no cover - needs real stdio
     """Start the app and serve its tools over stdio until the stream closes.
 
     ``background=True`` (the default) opens an in-memory task runner so
     ``@tool(background=True)`` tools can run in the background; set it to
     ``False`` to serve inline-only (such a tool then fails loudly at build).
+    ``axis_binders`` is passed through to `build_server`.
     """
     async with app.run(), _optional_runner(background) as runner:
         server = build_server(
@@ -563,6 +606,7 @@ async def run_stdio(
             exclude=exclude,
             confirm_destructive=confirm_destructive,
             runner=runner,
+            axis_binders=axis_binders,
         )
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
