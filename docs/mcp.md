@@ -26,8 +26,9 @@ class Weather(AComponent[WeatherSettings, str, Forecast]):
 Exposure is opt-in: only `@tool`-marked invocables become tools, so health
 checks and internal helpers stay private. `@tool` accepts a `name`/`title`
 override, a `description` (else the method docstring is used), the MCP
-annotation hints `read_only`, `destructive`, `idempotent`, `open_world`, and
-free-form `tags` used to [filter](#filtering) which tools a server exposes. A
+annotation hints `read_only`, `destructive`, `idempotent`, `open_world`,
+free-form `tags` used to [filter](#filtering) which tools a server exposes, and
+`background=True` for [long-running tools](#background-long-running-tools). A
 `@tool` on a method that is not `@invocable` is rejected when the server is
 built.
 
@@ -101,7 +102,7 @@ machine-readable guidance:
 
 | meta key | Meaning |
 | --- | --- |
-| `warpweft.error` | a stable code: `invalid_arguments`, `circuit_open`, `timeout`, `retry_exhausted`, `unavailable`, `transient`, `permanent`, `error` - plus `declined` / `confirmation_unsupported` from the [destructive-tool gate](#confirming-destructive-tools) |
+| `warpweft.error` | a stable code: `invalid_arguments`, `circuit_open`, `timeout`, `retry_exhausted`, `unavailable`, `transient`, `permanent`, `error` - plus `declined` / `confirmation_unsupported` from the [destructive-tool gate](#confirming-destructive-tools), and `unknown_task` / `not_ready` / `cancelled` / `failed` from the [background task tools](#background-long-running-tools) (`not_ready` is the only retryable one) |
 | `warpweft.retryable` | whether calling again can help |
 | `warpweft.retry_after_s` | for `circuit_open`: seconds until the breaker admits a probe |
 | `warpweft.attempts` | for `retry_exhausted`: attempts already spent |
@@ -140,6 +141,57 @@ Cancellation needs no code at all: when the client cancels an MCP request,
 the SDK cancels the handler's anyio scope, the cancellation unwinds the
 policy chain, and the component's cleanup (`finally` blocks, context
 managers) runs as usual.
+
+## Background (long-running) tools
+
+A tool that runs for minutes should not hold its `tools/call` open that long -
+many clients and proxies time out. Mark it `background=True` and it becomes a
+non-blocking **submit**: the call returns a `task_id` at once and the work runs
+in the background. The caller then polls with the shared built-in tools.
+
+```python
+class Reports(AComponent[ReportSettings, str, Report]):
+    @tool(background=True, description="Generate a monthly report.")
+    @invocable
+    async def report(self, month: str) -> Report:
+        await report_progress(0.5, message="crunching")
+        return Report(...)
+```
+
+When at least one background tool is served, three shared tools appear:
+
+- **`task_status(task_id)`** - `working` / `completed` / `failed` / `cancelled`,
+  plus the latest `report_progress` message.
+- **`task_result(task_id)`** - the finished result, or a `not_ready` tool error
+  while it is still running. The payload is the origin op's return value, fully
+  typed and secret-masked, wrapped as `{"result": ...}`. Its `outputSchema` is
+  the `oneOf` union of every background op's result schema, so a model still
+  knows the shapes to expect.
+- **`task_cancel(task_id)`** - requests cancellation; the job's policy chain
+  unwinds and the task settles to `cancelled`.
+
+This is all plain `tools/call` returning `CallToolResult`, so it needs no
+special transport - it works over stdio today. Everything else about a tool
+still applies: arguments are validated before submit, `report_progress` becomes
+task status (not client notifications, since the request already returned), and
+`confirm_destructive` gates the submit so a task never starts without consent.
+
+`run_stdio` opens an in-memory task runner by default (`background=False` serves
+inline-only). For programmatic use, pass your own store and runner:
+
+```python
+from warpweft.mcp import build_server, task_runner
+
+async with task_runner(store=my_store) as runner:  # your store survives restarts
+    server = build_server(app, runner=runner)
+    ...
+```
+
+The names `task_status` / `task_result` / `task_cancel` are reserved; a
+component tool claiming one, or a `background=True` tool served without a
+runner, raises a `FrameworkError` at build time. The default in-memory store
+keeps task state and results for the process lifetime only - a deployment that
+must survive a restart supplies its own `TaskStore` (Redis, Postgres, ...).
 
 ## Confirming destructive tools
 

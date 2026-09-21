@@ -31,7 +31,29 @@ from warpweft.runtime import App
 
 from .errors import error_result
 from .schema import tool_input_schema
+from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRunner, TaskStatusView, status_view, task_runner
 from .tool import ToolMeta, is_tool, tool_meta
+
+#: Names of the shared built-in tools that drive background execution. They are
+#: reserved: a component tool may not claim one (checked at build time).
+_TASK_STATUS = "task_status"
+_TASK_RESULT = "task_result"
+_TASK_CANCEL = "task_cancel"
+_RESERVED_NAMES = frozenset({_TASK_STATUS, _TASK_RESULT, _TASK_CANCEL})
+
+#: A ``@tool(background=True)`` submit returns only the task id.
+_SUBMIT_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"task_id": {"type": "string"}},
+    "required": ["task_id"],
+}
+#: Every built-in task tool takes a single ``task_id``.
+_TASK_ID_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"task_id": {"type": "string"}},
+    "required": ["task_id"],
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -179,7 +201,14 @@ def _output_contract(binding: ToolBinding) -> tuple[dict[str, Any], bool]:
 def _describe_tool(cls: type, binding: ToolBinding) -> mt.Tool:
     method = getattr(cls, binding.method)
     description = binding.meta.description or (inspect.getdoc(method) or None)
-    output_schema, _ = _output_contract(binding)
+    if binding.meta.background:
+        # A background tool is a *submit*: it advertises the op's args as input
+        # but returns only a task id; the result is fetched later via task_result.
+        note = "Starts a background task and returns a task_id; poll task_status / task_result."
+        description = f"{description} {note}" if description else note
+        output_schema: dict[str, Any] = _SUBMIT_OUTPUT_SCHEMA
+    else:
+        output_schema, _ = _output_contract(binding)
     return mt.Tool(
         name=binding.name,
         title=binding.meta.title,
@@ -190,15 +219,137 @@ def _describe_tool(cls: type, binding: ToolBinding) -> mt.Tool:
     )
 
 
+def _rewrite_refs(node: Any, remap: dict[str, str]) -> Any:
+    """Return ``node`` with every ``$ref`` string rewritten per ``remap``."""
+    if isinstance(node, dict):
+        return {
+            key: (remap.get(value, value) if key == "$ref" and isinstance(value, str) else _rewrite_refs(value, remap))
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [_rewrite_refs(item, remap) for item in node]
+    return node
+
+
+def _namespaced_defs(binding: ToolBinding) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A background op's result schema and ``$defs``, namespaced by the tool name.
+
+    ``$ref`` pointers are root-relative (``#/$defs/Foo``), so hoisting several
+    ops' ``$defs`` into one root would let two different models that share a
+    name overwrite each other. Prefixing each op's defs with its (unique) tool
+    name and rewriting that op's refs to match keeps the union collision-free.
+    """
+    schema = dict(binding.spec.output_json_schema())
+    member_defs = schema.pop("$defs", None)
+    if not member_defs:
+        return schema, {}
+    prefix = f"{binding.name}."
+    remap = {f"#/$defs/{key}": f"#/$defs/{prefix}{key}" for key in member_defs}
+    member = _rewrite_refs(schema, remap)
+    renamed = {f"{prefix}{key}": _rewrite_refs(value, remap) for key, value in member_defs.items()}
+    return member, renamed
+
+
+def _task_result_output_schema(bindings: list[ToolBinding]) -> dict[str, Any]:
+    """The ``task_result`` output schema: a union of every background op's result.
+
+    Each background result is stored wrapped as ``{"result": <value>}`` (see
+    `_result`), so the advertised schema is that wrapper with the inner value
+    constrained to the ``oneOf`` of the ops' raw output schemas.
+    """
+    members: list[dict[str, Any]] = []
+    all_defs: dict[str, Any] = {}
+    if len(bindings) == 1:
+        # A single op cannot collide with itself, so keep its defs unprefixed.
+        only = dict(bindings[0].spec.output_json_schema())
+        defs = only.pop("$defs", None)
+        members.append(only)
+        if defs:
+            all_defs = defs
+    else:
+        for binding in bindings:
+            member, renamed = _namespaced_defs(binding)
+            members.append(member)
+            all_defs.update(renamed)  # keys prefixed by the unique tool name
+    result_schema = members[0] if len(members) == 1 else {"oneOf": members}
+    wrapper: dict[str, Any] = {
+        "type": "object",
+        "properties": {"result": result_schema},
+        "required": ["result"],
+    }
+    if all_defs:
+        wrapper["$defs"] = all_defs
+    return wrapper
+
+
+def _task_tool_descriptors(background: list[ToolBinding]) -> list[mt.Tool]:
+    """Descriptors for the shared built-in tools (present iff background tools exist)."""
+    read_only = mt.ToolAnnotations(read_only_hint=True)
+    return [
+        mt.Tool(
+            name=_TASK_STATUS,
+            description="Poll a background task's status.",
+            input_schema=_TASK_ID_INPUT_SCHEMA,
+            output_schema=TaskStatusView.model_json_schema(),
+            annotations=read_only,
+        ),
+        mt.Tool(
+            name=_TASK_RESULT,
+            description="Fetch a finished background task's result (error if it is not done yet).",
+            input_schema=_TASK_ID_INPUT_SCHEMA,
+            output_schema=_task_result_output_schema(background),
+            annotations=read_only,
+        ),
+        mt.Tool(
+            name=_TASK_CANCEL,
+            description="Request cancellation of a background task.",
+            input_schema=_TASK_ID_INPUT_SCHEMA,
+            output_schema=TaskStatusView.model_json_schema(),
+        ),
+    ]
+
+
 def _serialize(binding: ToolBinding, value: Any) -> Any:
     return binding.spec.output_adapter.dump_python(value, mode="json")
+
+
+def _result(binding: ToolBinding, outcome: Any, *, wrap: bool) -> mt.CallToolResult:
+    """Serialize an invoke outcome into a ``CallToolResult``.
+
+    Text stays the raw serialization (readable for humans). ``wrap`` controls
+    the structured content: an inline call wraps only when its advertised schema
+    is the ``{"result": ...}`` wrapper (a non-object return), while a background
+    result always wraps so ``task_result`` has one uniform union schema.
+    """
+    serialized = _serialize(binding, outcome.value)
+    text = serialized if isinstance(serialized, str) else json.dumps(serialized)
+    return mt.CallToolResult(
+        content=[mt.TextContent(type="text", text=text)],
+        structured_content={"result": serialized} if wrap else serialized,
+        meta={"warpweft.source": outcome.source, "warpweft.degraded": outcome.degraded},
+    )
+
+
+def _success_result(binding: ToolBinding, outcome: Any) -> mt.CallToolResult:
+    """Build the inline success result; the wrap decision follows the advertised
+    schema, not the runtime value, so structured content always conforms."""
+    _, wrapped = _output_contract(binding)
+    return _result(binding, outcome, wrap=wrapped)
+
+
+def _status_result(view: TaskStatusView) -> mt.CallToolResult:
+    dumped = view.model_dump(mode="json")
+    return mt.CallToolResult(
+        content=[mt.TextContent(type="text", text=json.dumps(dumped))],
+        structured_content=dumped,
+    )
 
 
 _ELICITATION = mt.ClientCapabilities(elicitation=mt.ElicitationCapability())
 
 
-def _refusal(text: str, *, code: str) -> mt.CallToolResult:
-    meta = {"warpweft.error": code, "warpweft.retryable": False}
+def _refusal(text: str, *, code: str, retryable: bool = False) -> mt.CallToolResult:
+    meta = {"warpweft.error": code, "warpweft.retryable": retryable}
     return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)], is_error=True, meta=meta)
 
 
@@ -234,6 +385,7 @@ def build_server(
     include: Collection[str] | None = None,
     exclude: Collection[str] | None = None,
     confirm_destructive: bool = False,
+    runner: TaskRunner | None = None,
 ) -> Server[Any]:
     """Wire an MCP server exposing the app's tools. The app must be started.
 
@@ -245,15 +397,38 @@ def build_server(
     ``confirm_destructive=True`` gates every ``destructive=True`` tool behind
     an MCP elicitation: the user must accept before the call runs. Decline
     (or a client that cannot elicit) is a tool error; the call never happens.
+
+    ``runner`` enables ``@tool(background=True)`` tools: such a tool becomes a
+    non-blocking *submit* (returns a ``task_id``), and the server also exposes
+    the shared ``task_status`` / ``task_result`` / ``task_cancel`` tools. A
+    background tool without a ``runner`` is a `FrameworkError` - the advertised
+    behaviour must be real. Everything here is plain ``tools/call``, so it needs
+    no special transport.
     """
     bindings = {b.name: b for b in collect_tools(app, tags=tags, include=include, exclude=exclude)}
     classes = {name: app.registry.get(name) for name in app.registry.names()}
 
+    collisions = sorted(bindings.keys() & _RESERVED_NAMES)
+    if collisions:
+        raise FrameworkError(f"tool name(s) {collisions} are reserved for background task tools")
+
+    background = [b for b in bindings.values() if b.meta.background]
+    if background and runner is None:
+        names = sorted(b.name for b in background)
+        raise FrameworkError(
+            f"tool(s) {names} are @tool(background=True) but the server has no task runner; "
+            "pass build_server(..., runner=...) (see warpweft.mcp.tasks.task_runner)"
+        )
+    task_tools = _task_tool_descriptors(background) if background else []
+
     async def on_list_tools(ctx: Any, params: Any) -> mt.ListToolsResult:
         tools = [_describe_tool(classes[b.component], b) for b in bindings.values()]
-        return mt.ListToolsResult(tools=tools)
+        return mt.ListToolsResult(tools=tools + task_tools)
 
     async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> mt.CallToolResult:
+        if params.name in _RESERVED_NAMES:
+            return await _handle_task_tool(runner, params)
+
         binding = bindings.get(params.name)
         if binding is None:
             unknown = mt.TextContent(type="text", text=f"unknown tool '{params.name}'")
@@ -268,11 +443,15 @@ def build_server(
         kwargs = {field: getattr(model, field) for field in type(model).model_fields}
 
         # Confirmation comes after validation (no point confirming a call that
-        # would fail anyway) and before any execution.
+        # would fail anyway) and before any execution - including a background
+        # submit, so the task never starts without consent.
         if confirm_destructive and binding.meta.destructive:
             denial = await _confirm_destructive(ctx, binding)
             if denial is not None:
                 return denial
+
+        if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
+            return await _submit(app, runner, binding, kwargs)
 
         async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
             # Best-effort: a failed notification must never fail the call.
@@ -290,19 +469,71 @@ def build_server(
         except Exception as exc:
             return error_result(exc)
 
-        serialized = _serialize(binding, outcome.value)
-        # Text stays the raw serialization (readable for humans); the wrap
-        # decision follows the advertised schema, not the runtime value, so
-        # structured content always conforms to the output schema.
-        text = serialized if isinstance(serialized, str) else json.dumps(serialized)
-        _, wrapped = _output_contract(binding)
-        return mt.CallToolResult(
-            content=[mt.TextContent(type="text", text=text)],
-            structured_content={"result": serialized} if wrapped else serialized,
-            meta={"warpweft.source": outcome.source, "warpweft.degraded": outcome.degraded},
-        )
+        return _success_result(binding, outcome)
 
     return Server(name, version=version, on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+
+
+async def _submit(app: App, runner: TaskRunner, binding: ToolBinding, kwargs: dict[str, Any]) -> mt.CallToolResult:
+    """Start a background job and return its task id immediately."""
+
+    async def job(task_id: str) -> mt.CallToolResult:
+        # Progress becomes status updates on the task record, since the submit
+        # request has already been answered with the id.
+        async def to_status(progress: float, total: float | None, message: str | None) -> None:
+            with contextlib.suppress(Exception):
+                await runner.store.update(task_id, status="working", status_message=message)
+
+        try:
+            with use_progress_sink(to_status):
+                outcome = await app.container.invoke(binding.component, binding.method, **kwargs)
+        except Exception as exc:
+            return error_result(exc)
+        # Always wrap: task_result advertises one union schema over {"result": ...}.
+        return _result(binding, outcome, wrap=True)
+
+    record = await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS)
+    task_id = {"task_id": record.task_id}
+    return mt.CallToolResult(
+        content=[mt.TextContent(type="text", text=json.dumps(task_id))],
+        structured_content=task_id,
+    )
+
+
+async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolRequestParams) -> mt.CallToolResult:
+    """Serve task_status / task_result / task_cancel against the runner's store."""
+    if runner is None:
+        unknown = mt.TextContent(type="text", text=f"unknown tool '{params.name}'")
+        return mt.CallToolResult(content=[unknown], is_error=True)
+
+    task_id = (params.arguments or {}).get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return _refusal("task_id is required", code="invalid_arguments")
+
+    record = await runner.store.get(task_id)
+    if record is None:
+        return _refusal(f"unknown task '{task_id}'", code="unknown_task")
+
+    if params.name == _TASK_STATUS:
+        return _status_result(status_view(record))
+
+    if params.name == _TASK_CANCEL:
+        await runner.cancel(task_id)
+        # Report the state as it stands; the job settles to ``cancelled``
+        # asynchronously as its scope unwinds.
+        fresh = await runner.store.get(task_id)
+        return _status_result(status_view(fresh or record))
+
+    # _TASK_RESULT: the stored payload is already typed and secret-masked.
+    if record.result is not None:
+        return record.result
+    if record.status in TERMINAL:
+        # Terminal but no payload (cancelled, or a job that failed before
+        # producing a result): a distinct, non-retryable code - never the
+        # retry-implying not_ready, which would make a poller loop forever.
+        return _refusal(f"task '{task_id}' ended without a result (status: {record.status})", code=record.status)
+    # Still running: the result will appear, so invite the caller to poll again.
+    return _refusal(f"task '{task_id}' is not finished yet (status: {record.status})", code="not_ready", retryable=True)
 
 
 async def run_stdio(
@@ -314,9 +545,15 @@ async def run_stdio(
     include: Collection[str] | None = None,
     exclude: Collection[str] | None = None,
     confirm_destructive: bool = False,
+    background: bool = True,
 ) -> None:  # pragma: no cover - needs real stdio
-    """Start the app and serve its tools over stdio until the stream closes."""
-    async with app.run():
+    """Start the app and serve its tools over stdio until the stream closes.
+
+    ``background=True`` (the default) opens an in-memory task runner so
+    ``@tool(background=True)`` tools can run in the background; set it to
+    ``False`` to serve inline-only (such a tool then fails loudly at build).
+    """
+    async with app.run(), _optional_runner(background) as runner:
         server = build_server(
             app,
             name=name,
@@ -325,6 +562,17 @@ async def run_stdio(
             include=include,
             exclude=exclude,
             confirm_destructive=confirm_destructive,
+            runner=runner,
         )
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+@contextlib.asynccontextmanager
+async def _optional_runner(enabled: bool) -> Any:
+    """Yield a `TaskRunner` when ``enabled``, else ``None`` (no nursery opened)."""
+    if not enabled:
+        yield None
+        return
+    async with task_runner() as runner:
+        yield runner
