@@ -1047,14 +1047,15 @@ wheels = [
 
 [[package]]
 name = "mkdocs-literate-nav"
-version = "0.6.1"
+version = "0.6.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mkdocs" },
+    { name = "properdocs" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4d/f9/c48a04f3cf484f8016a343c1d7d99c3a1ef01dbb33ceabb1d02e0ecabda7/mkdocs_literate_nav-0.6.1.tar.gz", hash = "sha256:78a7ab6d878371728acb0cdc6235c9b0ffc6e83c997b037f4a5c6ff7cef7d759", size = 16437, upload-time = "2023-09-10T22:17:16.815Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/af/dd3776a7a713f798f79bec7eb9c661d5cfb83ddc17d9a3667595e53e1559/mkdocs_literate_nav-0.6.3.tar.gz", hash = "sha256:edbaca22343f861fe4e34aac47d55a0c9955c640dbf02eea99fe631e914cf9ee", size = 17526, upload-time = "2026-03-16T23:26:50.688Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/3b/e00d839d3242844c77e248f9572dd34644a04300839a60fe7d6bf652ab19/mkdocs_literate_nav-0.6.1-py3-none-any.whl", hash = "sha256:e70bdc4a07050d32da79c0b697bd88e9a104cf3294282e9cb20eec94c6b0f401", size = 13182, upload-time = "2023-09-10T22:17:18.751Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/2c/bcf1ae903975ad6f169abb05c1eb0f94395478364deb89270cf034081b29/mkdocs_literate_nav-0.6.3-py3-none-any.whl", hash = "sha256:2c421561280fa9184f88cbf399bebbd4cc17ee507e978a31ce11fd6f3aabf233", size = 13355, upload-time = "2026-03-16T23:26:49.562Z" },
 ]
 
 [[package]]
@@ -2123,7 +2124,7 @@ dev = [
 ]
 docs = [
     { name = "mkdocs-gen-files", specifier = ">=0.5,<0.7" },
-    { name = "mkdocs-literate-nav", specifier = ">=0.6,<0.6.2" },
+    { name = "mkdocs-literate-nav", specifier = ">=0.6,<0.6.4" },
     { name = "mkdocs-material", specifier = ">=9.5" },
     { name = "mkdocs-section-index", specifier = ">=0.3,<0.3.11" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=0.26" },
