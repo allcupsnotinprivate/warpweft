@@ -12,10 +12,11 @@ from typing import TYPE_CHECKING, Any
 from .tool import ToolMeta, is_tool, tool
 
 if TYPE_CHECKING:
-    from .server import ToolBinding, build_server, collect_tools, run_stdio
+    from .server import AxisBinder, ToolBinding, build_server, collect_tools, run_stdio
     from .tasks import InMemoryTaskStore, TaskRecord, TaskRunner, TaskStore, task_runner
 
 __all__ = [
+    "AxisBinder",
     "InMemoryTaskStore",
     "TaskRecord",
     "TaskRunner",
@@ -31,7 +32,7 @@ __all__ = [
 ]
 
 #: Names served lazily from ``.server`` (which imports the mcp SDK).
-_LAZY_SERVER = frozenset({"ToolBinding", "build_server", "collect_tools", "run_stdio"})
+_LAZY_SERVER = frozenset({"AxisBinder", "ToolBinding", "build_server", "collect_tools", "run_stdio"})
 #: Names served lazily from ``.tasks`` (which imports the mcp SDK).
 _LAZY_TASKS = frozenset({"InMemoryTaskStore", "TaskRecord", "TaskRunner", "TaskStore", "task_runner"})
 

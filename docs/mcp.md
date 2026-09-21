@@ -193,6 +193,37 @@ runner, raises a `FrameworkError` at build time. The default in-memory store
 keeps task state and results for the process lifetime only - a deployment that
 must survive a restart supplies its own `TaskStore` (Redis, Postgres, ...).
 
+## Per-request axes (tenancy)
+
+A [scoped component](composition.md) slices its state along [axes](runtime.md)
+(a `tenant`, a region, ...). Over MCP those axis values have to come from the
+call. `build_server`/`run_stdio` take `axis_binders` - a map from an
+`AxisHandle` (returned by `app.axis(...)`) to a function that derives its value
+from each call:
+
+```python
+tenant = app.axis("tenant")  # or app.axis("tenant", default="public")
+
+server = build_server(
+    app,
+    axis_binders={tenant: lambda ctx, params: ctx.headers.get("x-tenant")},
+)
+```
+
+The value is bound (via the axis's contextvar) around the call, so a scoped
+component resolves the right slice; returning `None` leaves the axis to its
+default (or, for a required axis, fails the call). The binder receives the
+request context `ctx` (session, headers, `_meta`) and the call `params` (tool
+name and arguments), so tenancy can come from a header, the auth context, or a
+tool argument. A background submit binds the axis across `runner.start`, so the
+[background job](#background-long-running-tools) inherits the submit-time value.
+A binder that raises becomes a tool error, never a transport failure.
+
+Without `axis_binders`, an axis value must instead be bound by the host around
+the call - e.g. ASGI middleware that reads the tenant and enters
+`tenant.use(...)` before dispatching to the MCP handler. `axis_binders` just
+moves that wiring into the server so stdio and non-ASGI hosts get it too.
+
 ## Confirming destructive tools
 
 ```python
