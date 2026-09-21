@@ -10,12 +10,13 @@ through ``container.invoke`` - the full policy chain and telemetry - so a task
 is just a call whose result is retained instead of returned inline. Persistence
 beyond a single process (surviving a restart) is the store's concern.
 
-The MCP *wire* surface for tasks (a client augmenting ``tools/call``, a
-``CreateTaskResult`` handle, ``tasks/get`` / ``tasks/result`` / ``tasks/cancel``)
-is **not** wired here yet: in the current SDK that feature only exists on the
-modern ``2026-07-28`` streamable-HTTP transport, which is unreachable over the
-stdio initialize handshake warpweft serves today. This substrate is the
-foundation that transport will build on when it lands.
+This substrate is transport-agnostic. warpweft consumes it in ``server.py`` to
+expose ``@tool(background=True)`` operations as plain ``tools/call`` tools - a
+*submit* that returns a ``task_id`` plus shared ``task_status`` / ``task_result``
+/ ``task_cancel`` tools - so long-running work needs no special MCP transport
+and works over stdio today. (The native MCP task *wire* feature, which would let
+a client augment ``tools/call`` directly, only exists on the modern
+``2026-07-28`` streamable-HTTP transport and is deliberately not used.)
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -28,6 +29,7 @@ import anyio
 import anyio.abc
 import mcp.types as mt
 from mcp_types import TaskStatus
+from pydantic import BaseModel
 
 from warpweft.core.clock import Clock, SystemClock
 
@@ -52,8 +54,21 @@ class TaskRecord:
     ttl_ms: int | None
     poll_interval_ms: int | None
     status_message: str | None = None
-    #: The final ``tools/call`` payload, retained for ``tasks/result``.
+    #: The final ``tools/call`` payload, retained for ``task_result``.
     result: mt.CallToolResult | None = None
+
+
+class TaskStatusView(BaseModel):
+    """What the ``task_status`` tool reports about a task (its output shape)."""
+
+    task_id: str
+    status: TaskStatus
+    message: str | None = None
+
+
+def status_view(record: TaskRecord) -> TaskStatusView:
+    """Project a stored record onto the status the caller polls for."""
+    return TaskStatusView(task_id=record.task_id, status=record.status, message=record.status_message)
 
 
 class TaskStore(Protocol):
@@ -135,9 +150,10 @@ class InMemoryTaskStore:
         return age_ms > record.ttl_ms
 
 
-#: A background job: given its task id, run to completion and return the
-#: final tool payload. The runner handles storing status and catching cancel.
-TaskJob = Callable[[], Awaitable[mt.CallToolResult]]
+#: A background job: given its task id (so it can route progress to the store),
+#: run to completion and return the final tool payload. The runner stores the
+#: terminal status/result and catches cancellation.
+TaskJob = Callable[[str], Awaitable[mt.CallToolResult]]
 
 
 class TaskRunner:
@@ -145,31 +161,48 @@ class TaskRunner:
 
     The nursery is injected (see `task_runner`) so it outlives individual
     requests but is bounded by the server's lifetime. Each running task keeps a
-    `CancelScope` so ``tasks/cancel`` can stop exactly one job; on shutdown the
+    `CancelScope` so ``task_cancel`` can stop exactly one job; on shutdown the
     nursery is cancelled and every outstanding job unwinds through its policy
     chain.
+
+    ``id_factory`` mints task ids. The default is a per-runner monotonic counter
+    (``task-1``, ``task-2``, ...), which keeps tests deterministic; a deployment
+    running several servers against one shared store should pass a
+    globally-unique factory (e.g. ``uuid4``).
     """
 
-    def __init__(self, task_group: anyio.abc.TaskGroup, store: TaskStore, clock: Clock) -> None:
+    def __init__(
+        self,
+        task_group: anyio.abc.TaskGroup,
+        store: TaskStore,
+        clock: Clock,
+        *,
+        id_factory: Callable[[], str] | None = None,
+    ) -> None:
         self._tg = task_group
         self._store = store
         self._clock = clock
         self._scopes: dict[str, anyio.CancelScope] = {}
+        self._counter = 0
+        self._id_factory = id_factory or self._counter_id
 
     @property
     def store(self) -> TaskStore:
         return self._store
 
-    async def start(self, task_id: str, tool: str, job: TaskJob, *, ttl_ms: int | None) -> TaskRecord:
-        """Durably create the task, then spawn it. Returns the initial record.
+    def _counter_id(self) -> str:
+        self._counter += 1
+        return f"task-{self._counter}"
+
+    async def start(self, tool: str, job: TaskJob, *, ttl_ms: int | None) -> TaskRecord:
+        """Mint an id, durably create the task, then spawn it.
 
         The record is persisted before we return so a poll that races the
-        spawn always finds the task (the spec requires durable creation before
-        the response is sent).
+        spawn always finds the task.
         """
         now = self._clock.now()
         record = TaskRecord(
-            task_id=task_id,
+            task_id=self._id_factory(),
             tool=tool,
             status="working",
             created_at=now,
@@ -178,7 +211,7 @@ class TaskRunner:
             poll_interval_ms=DEFAULT_POLL_INTERVAL_MS,
         )
         await self._store.create(record)
-        self._tg.start_soon(self._run, task_id, job)
+        self._tg.start_soon(self._run, record.task_id, job)
         return record
 
     async def cancel(self, task_id: str) -> None:
@@ -192,12 +225,12 @@ class TaskRunner:
         self._scopes[task_id] = scope
         try:
             with scope:
-                result = await job()
+                result = await job(task_id)
                 status: TaskStatus = "failed" if result.is_error else "completed"
                 await self._store.update(task_id, status=status, result=result)
                 return
             # Falls through here only when the scope caught its own
-            # cancellation (a tasks/cancel). Shield the bookkeeping so the
+            # cancellation (a task_cancel). Shield the bookkeeping so the
             # cancellation cannot also interrupt the status write.
             with anyio.CancelScope(shield=True):
                 await self._store.update(task_id, status="cancelled")
@@ -212,7 +245,12 @@ class TaskRunner:
 
 
 @asynccontextmanager
-async def task_runner(store: TaskStore | None = None, *, clock: Clock | None = None) -> AsyncIterator[TaskRunner]:
+async def task_runner(
+    store: TaskStore | None = None,
+    *,
+    clock: Clock | None = None,
+    id_factory: Callable[[], str] | None = None,
+) -> AsyncIterator[TaskRunner]:
     """Open a `TaskRunner` whose nursery lives for the duration of the block.
 
     Defaults to an `InMemoryTaskStore`. On exit the nursery is cancelled, so no
@@ -223,6 +261,6 @@ async def task_runner(store: TaskStore | None = None, *, clock: Clock | None = N
     store = store or InMemoryTaskStore(clock)
     async with anyio.create_task_group() as tg:
         try:
-            yield TaskRunner(tg, store, clock)
+            yield TaskRunner(tg, store, clock, id_factory=id_factory)
         finally:
             tg.cancel_scope.cancel()

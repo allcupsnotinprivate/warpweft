@@ -28,7 +28,10 @@ class ToolMeta:
     method docstring. The hint flags map to the MCP tool annotations that help
     a model reason about a call's effects. ``tags`` are free-form labels used
     to select which tools a server exposes (see ``collect_tools``); they are
-    never sent to the client.
+    never sent to the client. ``background=True`` exposes the tool as a
+    non-blocking *submit* (it returns a ``task_id`` at once and runs in the
+    background); the caller then polls the shared ``task_status`` / ``task_result``
+    tools and may ``task_cancel`` it.
     """
 
     name: str | None = None
@@ -39,6 +42,7 @@ class ToolMeta:
     idempotent: bool | None = None
     open_world: bool | None = None
     tags: frozenset[str] = frozenset()
+    background: bool = False
 
 
 @overload
@@ -54,6 +58,7 @@ def tool(
     idempotent: bool | None = ...,
     open_world: bool | None = ...,
     tags: Collection[str] | None = ...,
+    background: bool = ...,
 ) -> Callable[[F], F]: ...
 def tool(
     fn: F | None = None,
@@ -66,6 +71,7 @@ def tool(
     idempotent: bool | None = None,
     open_world: bool | None = None,
     tags: Collection[str] | None = None,
+    background: bool = False,
 ) -> F | Callable[[F], F]:
     """Mark an invocable method as an MCP tool. Usable bare or with arguments."""
     meta = ToolMeta(
@@ -77,6 +83,7 @@ def tool(
         idempotent=idempotent,
         open_world=open_world,
         tags=frozenset(tags or ()),
+        background=background,
     )
 
     def stamp(func: F) -> F:
