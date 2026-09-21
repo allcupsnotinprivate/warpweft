@@ -77,7 +77,7 @@ docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.26",
     # Pin below the releases that swapped their mkdocs dep for `properdocs`.
-    "mkdocs-gen-files>=0.5,<0.6",
+    "mkdocs-gen-files>=0.5,<0.7",
     "mkdocs-literate-nav>=0.6,<0.6.2",
     "mkdocs-section-index>=0.3,<0.3.11",
 ]
