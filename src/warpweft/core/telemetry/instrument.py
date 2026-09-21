@@ -1,4 +1,4 @@
-"""The instrumentation wrapper: one span per invocation, four metrics.
+"""The instrumentation wrapper: one span per invocation, five metrics.
 
 ``instrument`` wraps an assembled chain (any ``Next``) and is meant to be
 applied unconditionally, outside the outermost link. It installs an
@@ -6,9 +6,9 @@ OTel-backed observer into the context ``bag`` so links emit attempt spans and
 events through the ``warpweft.core.observe`` seam without importing OTel.
 
 Cardinality policy (see ``docs/telemetry.md``): axis values always attach to
-the degradation and breaker-rejection counters and to error-status call
-counts; they attach to the duration histogram and ok-status call counts only
-for values in the allowlist.
+the degradation, breaker-rejection and breaker-transition counters and to
+error-status call counts; they attach to the duration histogram and ok-status
+call counts only for values in the allowlist.
 """
 
 from collections.abc import Mapping
@@ -25,6 +25,7 @@ from warpweft.core.context import InvocationContext
 from warpweft.core.errors import DefaultErrorClassifier, ErrorClassifier
 from warpweft.core.observe import (
     EVENT_BREAKER_REJECTED,
+    EVENT_BREAKER_TRANSITION,
     FACT_CACHE,
     OBSERVER_KEY,
     AttributeValue,
@@ -77,16 +78,20 @@ class _OtelObserver:
         self,
         tracer: trace.Tracer,
         rejections: metrics.Counter,
-        rejection_attrs: Mapping[str, AttributeValue],
+        transitions: metrics.Counter,
+        counter_attrs: Mapping[str, AttributeValue],
     ) -> None:
         self._tracer = tracer
         self._rejections = rejections
-        self._rejection_attrs = rejection_attrs
+        self._transitions = transitions
+        self._counter_attrs = counter_attrs
 
     def event(self, name: str, attributes: Mapping[str, AttributeValue] | None = None) -> None:
         trace.get_current_span().add_event(name, attributes)
         if name == EVENT_BREAKER_REJECTED:
-            self._rejections.add(1, {**self._rejection_attrs, **(attributes or {})})
+            self._rejections.add(1, {**self._counter_attrs, **(attributes or {})})
+        elif name == EVENT_BREAKER_TRANSITION:
+            self._transitions.add(1, {**self._counter_attrs, **(attributes or {})})
 
     def span(self, name: str, attributes: Mapping[str, AttributeValue] | None = None) -> AbstractContextManager[object]:
         return self._tracer.start_as_current_span(name, attributes=attributes)
@@ -120,6 +125,9 @@ def instrument(
     rejections = meter.create_counter(
         conv.METRIC_BREAKER_REJECTIONS, unit=conv.UNIT_REJECTIONS, description="Calls rejected by an open breaker"
     )
+    transitions = meter.create_counter(
+        conv.METRIC_BREAKER_TRANSITIONS, unit=conv.UNIT_TRANSITIONS, description="Circuit breaker state transitions"
+    )
     error_classifier = classifier or DefaultErrorClassifier()
 
     async def call(ctx: InvocationContext) -> Outcome[Any]:
@@ -127,7 +135,7 @@ def instrument(
         axes_all = _axis_attrs(ctx.scope_key)
         axes_allowed = _axis_attrs(ctx.scope_key, config.axis_allowlist)
         operation_attr: dict[str, AttributeValue] = {conv.ATTR_OPERATION: ctx.operation}
-        observer = _OtelObserver(tracer, rejections, {**operation_attr, **axes_all})
+        observer = _OtelObserver(tracer, rejections, transitions, {**operation_attr, **axes_all})
 
         start_attrs: dict[str, AttributeValue] = {
             **operation_attr,

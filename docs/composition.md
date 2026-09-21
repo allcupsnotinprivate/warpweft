@@ -120,6 +120,17 @@ The container answers the questions that otherwise mean reading the core:
 - `snapshot()` - live runtime state: each breaker's state, each concurrency
   link's occupancy, and the live slice keys of scoped components.
 
+Circuit breakers can also be driven by hand (mirrored on `App`):
+
+- `force_open_breakers(endpoint=None)` / `reset_breakers(endpoint=None)` - open
+  or close live breakers, either all of them or only those guarding one
+  `endpoint`. Force-open re-arms `reset_timeout`; reset closes and clears the
+  window. Both return the number touched - breakers are created lazily on first
+  guarded call, so `0` means none are live yet. Manual changes are logged but
+  emit no transition metric. Best-effort under concurrency: a probe that
+  finishes just after `force_open` sees the open state and records nothing, and
+  a failure racing `reset` lands in the fresh window - both harmless.
+
 ## Health
 
 Liveness and readiness are separate:

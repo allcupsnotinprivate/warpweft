@@ -15,6 +15,9 @@ import pytest
 from warpweft.mcp import build_server
 from warpweft.runtime import App
 
+#: Enables the ``pytester`` fixture used by tests/test_pytest_plugin.py.
+pytest_plugins = ["pytester"]
+
 sys.path.insert(0, str(Path(__file__).parent))  # makes `sample_app` importable
 
 
