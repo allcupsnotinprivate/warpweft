@@ -90,6 +90,15 @@ with tenant.use("acme"):  # in a middleware/dependency
     data = await app.proxy(Reports).daily()  # scoped instances resolve to "acme"
 ```
 
+Every axis carries a soft cap, `max_cardinality` (default 1000;
+`app.axis("tenant", max_cardinality=50)`). The registry counts the distinct
+values it resolves per axis and logs a single warning (logger
+`warpweft.core.axes`) the first time a new value would exceed the cap -
+resolution itself is never blocked. Treat the warning as a leak detector: axis
+values feed per-slice state (scoped instances, breaker/concurrency slices) and
+error-counter metric attributes, so unbounded values (user ids, request ids)
+are a memory and cardinality leak.
+
 ## Correlation and budgets
 
 ```python

@@ -3,7 +3,10 @@
 No test sleeps for real: ManualClock drives the reset timeout.
 """
 
+from collections.abc import Mapping
 import contextlib
+from contextlib import AbstractContextManager, nullcontext
+import logging
 from typing import Any
 
 import anyio
@@ -13,6 +16,13 @@ import pytest
 from warpweft.core.clock import ManualClock
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import CircuitOpen, PermanentError, TransientError
+from warpweft.core.observe import (
+    ATTR_BREAKER_STATE_FROM,
+    ATTR_BREAKER_STATE_TO,
+    EVENT_BREAKER_TRANSITION,
+    OBSERVER_KEY,
+    AttributeValue,
+)
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.builtin.circuit_breaker import (
     ENDPOINT_SCOPE,
@@ -24,6 +34,26 @@ from warpweft.core.pipeline.builtin.circuit_breaker import (
 from warpweft.core.pipeline.interceptor import Next
 
 pytestmark = [pytest.mark.unit, pytest.mark.anyio]
+
+
+class Recorder:
+    """Minimal observer capturing the events links emit through the seam."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, AttributeValue]]] = []
+
+    def event(self, name: str, attributes: Mapping[str, AttributeValue] | None = None) -> None:
+        self.events.append((name, dict(attributes or {})))
+
+    def span(self, name: str, attributes: Mapping[str, AttributeValue] | None = None) -> AbstractContextManager[object]:
+        return nullcontext()
+
+    def transitions(self) -> list[tuple[str, str]]:
+        return [
+            (attrs[ATTR_BREAKER_STATE_FROM], attrs[ATTR_BREAKER_STATE_TO])  # type: ignore[misc]
+            for name, attrs in self.events
+            if name == EVENT_BREAKER_TRANSITION
+        ]
 
 
 class Call:
@@ -235,3 +265,150 @@ async def test_factory_scope_and_creation() -> None:
     base: Next = Call("ok").__call__
     outcome = await link.call(base, ctx())
     assert outcome.value == "ok"
+
+
+# --- manual controls ---------------------------------------------------------
+
+
+async def test_force_open_rejects_then_probes_after_reset_timeout() -> None:
+    clock = ManualClock()
+    cb = breaker(clock, reset_timeout=10.0)
+    await cb.force_open()
+    assert cb.state is CircuitState.OPEN
+
+    probe = Call("ok")
+    with pytest.raises(CircuitOpen):
+        await cb.call(probe, ctx())
+    assert probe.calls == 0
+
+    clock.advance(10.0)  # reset elapsed -> next call is the probe
+    outcome = await cb.call(Call("ok"), ctx())
+    assert outcome.value == "ok"
+    assert cb.state is CircuitState.CLOSED
+
+
+async def test_force_open_rearms_the_open_timer() -> None:
+    clock = ManualClock()
+    cb = breaker(clock, window=1, failure_threshold=1, reset_timeout=10.0)
+    with pytest.raises(TransientError):
+        await cb.call(Call("transient"), ctx())
+    assert cb.state is CircuitState.OPEN
+
+    clock.advance(6.0)
+    await cb.force_open()  # re-arms: the 10s window restarts from here
+
+    clock.advance(6.0)  # 12s since the original trip, but only 6s since force_open
+    with pytest.raises(CircuitOpen):
+        await cb.call(Call("ok"), ctx())
+
+    clock.advance(4.0)  # now 10s since force_open
+    outcome = await cb.call(Call("ok"), ctx())
+    assert outcome.value == "ok"
+
+
+async def test_reset_closes_and_clears_window() -> None:
+    cb = breaker(ManualClock(), window=3, failure_threshold=3)
+    fail = Call("transient")
+    for _ in range(2):  # 2 of 3 failures - not yet tripped
+        with pytest.raises(TransientError):
+            await cb.call(fail, ctx())
+
+    await cb.reset()  # forgets the two recorded failures
+    assert cb.state is CircuitState.CLOSED
+
+    for _ in range(2):  # two more failures still do not trip (window was cleared)
+        with pytest.raises(TransientError):
+            await cb.call(fail, ctx())
+    assert cb.state is CircuitState.CLOSED
+
+    with pytest.raises(TransientError):  # the third one trips
+        await cb.call(fail, ctx())
+    assert cb.state is CircuitState.OPEN
+
+
+async def test_reset_from_half_open_releases_probe_slot() -> None:
+    clock = ManualClock()
+    cb = breaker(clock, window=1, failure_threshold=1, reset_timeout=5.0)
+    with pytest.raises(TransientError):
+        await cb.call(Call("transient"), ctx())
+    clock.advance(5.0)
+
+    # Park a probe in flight, then reset from half-open.
+    started, released = anyio.Event(), anyio.Event()
+
+    async def slow_probe(c: InvocationContext) -> Outcome[Any]:
+        started.set()
+        await released.wait()
+        return Outcome(value="probe-ok")
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(lambda: cb.call(slow_probe, ctx()))  # type: ignore[arg-type,return-value]
+        await started.wait()
+        await cb.reset()  # closes and frees the probe slot
+        released.set()
+
+    assert cb.state is CircuitState.CLOSED
+    # A fresh call is admitted normally (the slot was released, not stuck).
+    outcome = await cb.call(Call("ok"), ctx())
+    assert outcome.value == "ok"
+
+
+async def test_reset_is_idempotent_when_closed() -> None:
+    cb = breaker(ManualClock())
+    await cb.reset()
+    await cb.reset()
+    assert cb.state is CircuitState.CLOSED
+
+
+# --- transition metric events ------------------------------------------------
+
+
+async def test_transition_events_cover_the_full_cycle() -> None:
+    clock = ManualClock()
+    cb = breaker(clock, window=1, failure_threshold=1, reset_timeout=5.0)
+    rec = Recorder()
+
+    with pytest.raises(TransientError):  # closed -> open
+        await cb.call(Call("transient"), ctx(bag={OBSERVER_KEY: rec}))
+    clock.advance(5.0)
+    outcome = await cb.call(Call("ok"), ctx(bag={OBSERVER_KEY: rec}))  # open -> half_open -> closed
+    assert outcome.value == "ok"
+
+    assert rec.transitions() == [
+        ("closed", "open"),
+        ("open", "half_open"),
+        ("half_open", "closed"),
+    ]
+
+
+async def test_probe_failure_emits_half_open_to_open() -> None:
+    clock = ManualClock()
+    cb = breaker(clock, window=1, failure_threshold=1, reset_timeout=5.0)
+    rec = Recorder()
+
+    with pytest.raises(TransientError):  # closed -> open
+        await cb.call(Call("transient"), ctx(bag={OBSERVER_KEY: rec}))
+    clock.advance(5.0)
+    with pytest.raises(TransientError):  # open -> half_open, probe fails -> half_open -> open
+        await cb.call(Call("transient"), ctx(bag={OBSERVER_KEY: rec}))
+
+    assert rec.transitions() == [
+        ("closed", "open"),
+        ("open", "half_open"),
+        ("half_open", "open"),
+    ]
+
+
+async def test_manual_controls_emit_no_events_but_log(caplog: pytest.LogCaptureFixture) -> None:
+    cb = breaker(ManualClock())
+    rec = Recorder()
+    # An observer is only reachable through a ctx; manual controls take none,
+    # so nothing can be emitted - but the state change is still logged.
+    with caplog.at_level(logging.INFO, logger="warpweft.core.pipeline.builtin.circuit_breaker"):
+        await cb.force_open()
+        await cb.reset()
+
+    assert rec.events == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("opened" in m for m in messages)
+    assert any("closed" in m for m in messages)

@@ -94,17 +94,20 @@ class App:
         """Discover and register third-party components advertised under ``group``."""
         return self._registry.load_entry_points(group)
 
-    def axis(self, name: str, *, default: str | None = None) -> AxisHandle:
+    def axis(self, name: str, *, default: str | None = None, max_cardinality: int = 1000) -> AxisHandle:
         """Register a contextvar-backed axis and return a handle to bind it.
 
         With a ``default`` the axis is optional (that value when unbound);
         without one it is required and resolving it while unbound is an error.
+        ``max_cardinality`` is a soft cap (default 1000): the registry logs a
+        single warning (logger ``warpweft.core.axes``) the first time a new
+        value would exceed it, but never blocks resolution.
         """
         var: ContextVar[str | None] = ContextVar(f"warpweft_axis_{name}", default=default)
         axis = (
-            Axis(name=name, resolver=var.get, on_missing="default", default=default)
+            Axis(name=name, resolver=var.get, on_missing="default", default=default, max_cardinality=max_cardinality)
             if default is not None
-            else Axis(name=name, resolver=var.get, on_missing="required")
+            else Axis(name=name, resolver=var.get, on_missing="required", max_cardinality=max_cardinality)
         )
         self._axes.register(axis)
         return AxisHandle(name, var)
@@ -217,6 +220,14 @@ class App:
     def correlation(self, correlation_id: str) -> AbstractContextManager[str]:
         """Bind a correlation id for calls made in the block (``with app.correlation(id):``)."""
         return use_correlation_id(correlation_id)
+
+    async def force_open_breakers(self, *, endpoint: str | None = None) -> int:
+        """Manually open live circuit breakers; return how many were flipped."""
+        return await self.container.force_open_breakers(endpoint=endpoint)
+
+    async def reset_breakers(self, *, endpoint: str | None = None) -> int:
+        """Manually close live circuit breakers; return how many were reset."""
+        return await self.container.reset_breakers(endpoint=endpoint)
 
     # --- embedding into a host ------------------------------------------------
 

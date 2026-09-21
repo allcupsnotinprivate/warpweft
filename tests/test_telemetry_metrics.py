@@ -1,4 +1,4 @@
-"""Instrumentation wrapper: the four metrics and the cardinality policy.
+"""Instrumentation wrapper: the five metrics and the cardinality policy.
 
 Fresh in-memory MeterProvider per test (cumulative temporality - asserted
 values are absolutes); the OTel globals are never touched.
@@ -195,6 +195,41 @@ async def test_rejection_escaping_to_the_wrapper_counts_once_and_errors() -> Non
     assert dict(calls.attributes)[conv.ATTR_ERROR_CLASS] == "transient"
 
 
+async def test_transitions_counter_records_each_state_change() -> None:
+    provider, reader = metering()
+    clock = ManualClock()
+    breaker = CircuitBreakerInterceptor(CircuitBreakerSettings(window=1, failure_threshold=1, reset_timeout=5.0), clock)
+
+    async def flaky(c: InvocationContext) -> Outcome[Any]:
+        raise TransientError("down")
+
+    async def trip(c: InvocationContext) -> Outcome[Any]:
+        return await breaker.call(flaky, c)
+
+    async def recover(c: InvocationContext) -> Outcome[Any]:
+        return await breaker.call(ok, c)
+
+    key = (("endpoint", "api.example"),)
+    wrapped_trip = instrument(trip, meter_provider=provider, clock=clock)
+    wrapped_recover = instrument(recover, meter_provider=provider, clock=clock)
+
+    with pytest.raises(TransientError):  # closed -> open
+        await wrapped_trip(ctx(scope_key=key))
+    clock.advance(5.0)
+    await wrapped_recover(ctx(scope_key=key))  # open -> half_open -> closed
+
+    metric = read(reader)[conv.METRIC_BREAKER_TRANSITIONS]
+    assert metric.unit == conv.UNIT_TRANSITIONS
+    points = {
+        (p.attributes[conv.ATTR_BREAKER_STATE_FROM], p.attributes[conv.ATTR_BREAKER_STATE_TO]): p.value
+        for p in metric.data.data_points
+    }
+    assert points == {("closed", "open"): 1, ("open", "half_open"): 1, ("half_open", "closed"): 1}
+    for point in metric.data.data_points:  # axes_all + operation attach to every point
+        assert point.attributes[conv.ATTR_OPERATION] == "op"
+        assert point.attributes[f"{conv.AXIS_ATTR_PREFIX}endpoint"] == "api.example"
+
+
 async def test_axes_do_not_reach_histogram_or_ok_calls_by_default() -> None:
     provider, reader = metering()
     await instrument(ok, meter_provider=provider)(ctx(scope_key=TWO_AXES))
@@ -242,3 +277,4 @@ async def test_nothing_recorded_means_no_data_points() -> None:
     metrics = read(reader)
     assert conv.METRIC_DEGRADATIONS not in metrics
     assert conv.METRIC_BREAKER_REJECTIONS not in metrics
+    assert conv.METRIC_BREAKER_TRANSITIONS not in metrics
