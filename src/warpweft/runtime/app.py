@@ -221,6 +221,14 @@ class App:
         """Bind a correlation id for calls made in the block (``with app.correlation(id):``)."""
         return use_correlation_id(correlation_id)
 
+    async def force_open_breakers(self, *, endpoint: str | None = None) -> int:
+        """Manually open live circuit breakers; return how many were flipped."""
+        return await self.container.force_open_breakers(endpoint=endpoint)
+
+    async def reset_breakers(self, *, endpoint: str | None = None) -> int:
+        """Manually close live circuit breakers; return how many were reset."""
+        return await self.container.reset_breakers(endpoint=endpoint)
+
     # --- embedding into a host ------------------------------------------------
 
     def lifespan(self, *_: Any) -> AbstractAsyncContextManager[None]:

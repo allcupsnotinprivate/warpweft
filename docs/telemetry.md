@@ -1,7 +1,7 @@
 # Telemetry
 
 Warpweft instruments every invocation with OpenTelemetry: one span per call,
-child spans per retry attempt, and four metrics. This page is the **stability
+child spans per retry attempt, and five metrics. This page is the **stability
 contract**: dashboards and alerts are built on these names, so renaming any
 span, event, attribute or metric listed here is a breaking change.
 
@@ -55,6 +55,7 @@ including each failed attempt span, not just the invocation.
 |---|---|---|
 | `warpweft.retry.backoff` | retry, right before the backoff sleep (lands on the invocation span) | `warpweft.backoff.delay` (seconds), `warpweft.attempt.number` (upcoming attempt) |
 | `warpweft.circuit_breaker.rejected` | circuit breaker, on rejecting a call | `warpweft.circuit_breaker.state` = `open` \| `half_open` |
+| `warpweft.circuit_breaker.transition` | circuit breaker, on every state change while processing a call | `warpweft.circuit_breaker.state.from`, `warpweft.circuit_breaker.state.to` (each `closed` \| `open` \| `half_open`) |
 
 ## Metrics
 
@@ -64,19 +65,28 @@ including each failed attempt span, not just the invocation.
 | `warpweft.call.duration` | Histogram | `s` | `warpweft.operation`, `warpweft.status` | only allowlisted |
 | `warpweft.degradations` | Counter | `{call}` | `warpweft.operation` | always |
 | `warpweft.circuit_breaker.rejections` | Counter | `{rejection}` | `warpweft.operation`, `warpweft.circuit_breaker.state` | always |
+| `warpweft.circuit_breaker.transitions` | Counter | `{transition}` | `warpweft.operation`, `warpweft.circuit_breaker.state.from`, `warpweft.circuit_breaker.state.to` | always |
 
 `warpweft.circuit_breaker.rejections` counts every rejection **at the moment
 the breaker rejects**, not when an exception escapes: an outer retry may
 recover from a rejection, and a degradation stub may swallow it - the counter
 still moves.
 
+`warpweft.circuit_breaker.transitions` counts the four organic state changes
+that happen while processing a call: `closed`→`open`, `open`→`half_open`,
+`half_open`→`closed` and `half_open`→`open` (at most four series per
+operation/axes - bounded). **Manual** transitions via
+`Container.force_open_breakers` / `reset_breakers` happen outside any
+invocation and are logged only - no metric point.
+
 ## Cardinality policy
 
 Axis values as metric attributes are the classic way to explode a time-series
 database, so:
 
-- **Error and rejection counters carry axes always** - failures are where the
-  per-slice breakdown pays off, and their volume is expected to be low.
+- **Error, rejection and transition counters carry axes always** - failures
+  are where the per-slice breakdown pays off, and their volume is expected to
+  be low.
 - **The duration histogram (and ok-status call counts) never carry axes by
   default.**
 - `TelemetryConfig(axis_allowlist=frozenset({...}))` grants full breakdown to

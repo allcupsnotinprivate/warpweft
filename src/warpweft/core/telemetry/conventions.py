@@ -14,7 +14,10 @@ from warpweft.core.observe import (
     ATTR_ATTEMPT_NUMBER,
     ATTR_BACKOFF_DELAY,
     ATTR_BREAKER_STATE,
+    ATTR_BREAKER_STATE_FROM,
+    ATTR_BREAKER_STATE_TO,
     EVENT_BREAKER_REJECTED,
+    EVENT_BREAKER_TRANSITION,
     EVENT_RETRY_BACKOFF,
     FACT_CACHE,
     FACT_DEGRADED,
@@ -26,6 +29,8 @@ __all__ = [
     "ATTR_ATTEMPT_NUMBER",
     "ATTR_BACKOFF_DELAY",
     "ATTR_BREAKER_STATE",
+    "ATTR_BREAKER_STATE_FROM",
+    "ATTR_BREAKER_STATE_TO",
     "ATTR_CACHE",
     "ATTR_CORRELATION_ID",
     "ATTR_DEGRADED",
@@ -35,11 +40,13 @@ __all__ = [
     "ATTR_STATUS",
     "AXIS_ATTR_PREFIX",
     "EVENT_BREAKER_REJECTED",
+    "EVENT_BREAKER_TRANSITION",
     "EVENT_RETRY_BACKOFF",
     "FACT_CACHE",
     "FACT_DEGRADED",
     "INSTRUMENTATION_NAME",
     "METRIC_BREAKER_REJECTIONS",
+    "METRIC_BREAKER_TRANSITIONS",
     "METRIC_CALLS",
     "METRIC_DEGRADATIONS",
     "METRIC_DURATION",
@@ -49,6 +56,7 @@ __all__ = [
     "UNIT_CALLS",
     "UNIT_REJECTIONS",
     "UNIT_SECONDS",
+    "UNIT_TRANSITIONS",
 ]
 
 #: Tracer and meter instrumentation name.
@@ -75,7 +83,9 @@ METRIC_CALLS: Final = "warpweft.calls"
 METRIC_DURATION: Final = "warpweft.call.duration"
 METRIC_DEGRADATIONS: Final = "warpweft.degradations"
 METRIC_BREAKER_REJECTIONS: Final = "warpweft.circuit_breaker.rejections"
+METRIC_BREAKER_TRANSITIONS: Final = "warpweft.circuit_breaker.transitions"
 
 UNIT_CALLS: Final = "{call}"
 UNIT_SECONDS: Final = "s"
 UNIT_REJECTIONS: Final = "{rejection}"
+UNIT_TRANSITIONS: Final = "{transition}"

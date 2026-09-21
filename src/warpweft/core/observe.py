@@ -36,6 +36,11 @@ ATTR_BACKOFF_DELAY: Final = "warpweft.backoff.delay"
 EVENT_BREAKER_REJECTED: Final = "warpweft.circuit_breaker.rejected"
 #: Breaker state attribute on rejection events ("open" | "half_open").
 ATTR_BREAKER_STATE: Final = "warpweft.circuit_breaker.state"
+#: Event emitted when the circuit breaker changes state during a call.
+EVENT_BREAKER_TRANSITION: Final = "warpweft.circuit_breaker.transition"
+#: State a transition moved from / to ("closed" | "open" | "half_open").
+ATTR_BREAKER_STATE_FROM: Final = "warpweft.circuit_breaker.state.from"
+ATTR_BREAKER_STATE_TO: Final = "warpweft.circuit_breaker.state.to"
 
 #: Bag fact written by the cache link: "hit" | "miss" | "coalesced".
 FACT_CACHE: Final = "cache"

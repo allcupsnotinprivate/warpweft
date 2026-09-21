@@ -313,6 +313,22 @@ async def test_budget_passthrough_on_invoke_and_proxy() -> None:
             await app.proxy(Flaky, budget=0.05).fetch()
 
 
+# --- breaker controls --------------------------------------------------------
+
+
+async def test_breaker_controls_passthrough() -> None:
+    registry = Registry()
+    registry.register(Greeter)
+    config = {"greeter": {"policy": {"circuit_breaker": {"window": 3, "failure_threshold": 3, "reset_timeout": 10.0}}}}
+    app = App(registry=registry, config=config)
+    async with app.run():
+        await app.invoke("greeter", "greet", whom="world")  # materialise the breaker
+        assert await app.force_open_breakers() == 1
+        assert app.container.snapshot().breakers[0].state == "open"
+        assert await app.reset_breakers() == 1
+        assert app.container.snapshot().breakers[0].state == "closed"
+
+
 async def test_correlation_helper_binds_the_ambient_id() -> None:
     from warpweft.core.context import InvocationContext
 
