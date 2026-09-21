@@ -28,7 +28,14 @@ from warpweft.core.axes import ScopeKey, ScopeSpec
 from warpweft.core.clock import Clock
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import CircuitOpen, DefaultErrorClassifier, ErrorClass, ErrorClassifier
-from warpweft.core.observe import ATTR_BREAKER_STATE, EVENT_BREAKER_REJECTED, observer_of
+from warpweft.core.observe import (
+    ATTR_BREAKER_STATE,
+    ATTR_BREAKER_STATE_FROM,
+    ATTR_BREAKER_STATE_TO,
+    EVENT_BREAKER_REJECTED,
+    EVENT_BREAKER_TRANSITION,
+    observer_of,
+)
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.interceptor import Interceptor, Next
 from warpweft.core.unit import Identity
@@ -95,10 +102,33 @@ class CircuitBreakerInterceptor:
         try:
             outcome = await next(ctx)
         except BaseException as exc:
-            await self._on_error(exc)
+            await self._on_error(exc, ctx)
             raise
-        await self._on_success()
+        await self._on_success(ctx)
         return outcome
+
+    async def force_open(self) -> None:
+        """Manually trip the breaker: OPEN now, a probe after ``reset_timeout``.
+
+        Unconditional - re-arms the reset timer when already open - and clears
+        the window and any probe slot. Logged, but emits no transition metric:
+        there is no invocation to attribute the change to.
+        """
+        async with self._lock:
+            self._open(None)
+
+    async def reset(self) -> None:
+        """Manually close the breaker, forgetting recorded failures.
+
+        Idempotent: an already-closed breaker just clears its window. Logged,
+        but emits no transition metric (no invocation to attribute it to).
+        """
+        async with self._lock:
+            if self._state is CircuitState.CLOSED:
+                self._window.clear()
+                self._probe_in_flight = False
+                return
+            self._close(None)
 
     async def _admit(self, ctx: InvocationContext) -> None:
         """Decide whether this call may proceed; may flip open -> half-open."""
@@ -108,6 +138,7 @@ class CircuitBreakerInterceptor:
                 if elapsed >= self._settings.reset_timeout:
                     self._state = CircuitState.HALF_OPEN
                     self._probe_in_flight = True  # this call is the probe
+                    self._emit_transition(ctx, CircuitState.OPEN, CircuitState.HALF_OPEN)
                     return
                 observer_of(ctx).event(EVENT_BREAKER_REJECTED, {ATTR_BREAKER_STATE: "open"})
                 raise CircuitOpen(
@@ -122,14 +153,14 @@ class CircuitBreakerInterceptor:
                 return
             # CLOSED: proceed normally.
 
-    async def _on_success(self) -> None:
+    async def _on_success(self, ctx: InvocationContext) -> None:
         async with self._lock:
             if self._state is CircuitState.HALF_OPEN:
-                self._close()
+                self._close(ctx)
             elif self._state is CircuitState.CLOSED:
                 self._window.append(False)
 
-    async def _on_error(self, exc: BaseException) -> None:
+    async def _on_error(self, exc: BaseException, ctx: InvocationContext) -> None:
         transient = self._classifier.classify(exc) == ErrorClass.TRANSIENT
         async with self._lock:
             if not transient:
@@ -139,24 +170,42 @@ class CircuitBreakerInterceptor:
                     self._probe_in_flight = False
                 return
             if self._state is CircuitState.HALF_OPEN:
-                self._open()
+                self._open(ctx)
             elif self._state is CircuitState.CLOSED:
                 self._window.append(True)
                 if sum(self._window) >= self._settings.failure_threshold:
-                    self._open()
+                    self._open(ctx)
 
-    def _open(self) -> None:
+    def _open(self, ctx: InvocationContext | None) -> None:
+        previous = self._state
         self._state = CircuitState.OPEN
         self._opened_at = self._clock.monotonic()
         self._window.clear()
         self._probe_in_flight = False
         logger.warning("circuit breaker %r opened", self.identity.uid)
+        self._emit_transition(ctx, previous, CircuitState.OPEN)
 
-    def _close(self) -> None:
+    def _close(self, ctx: InvocationContext | None) -> None:
+        previous = self._state
         self._state = CircuitState.CLOSED
         self._window.clear()
         self._probe_in_flight = False
         logger.info("circuit breaker %r closed", self.identity.uid)
+        self._emit_transition(ctx, previous, CircuitState.CLOSED)
+
+    def _emit_transition(self, ctx: InvocationContext | None, from_state: CircuitState, to_state: CircuitState) -> None:
+        """Emit a transition event when the change happens inside a call.
+
+        Manual transitions (``force_open``/``reset``) pass ``ctx=None``: there
+        is no invocation to attribute the event to, so nothing is emitted and
+        the logger calls in ``_open``/``_close`` remain the only manual signal.
+        """
+        if ctx is None:
+            return
+        observer_of(ctx).event(
+            EVENT_BREAKER_TRANSITION,
+            {ATTR_BREAKER_STATE_FROM: from_state.value, ATTR_BREAKER_STATE_TO: to_state.value},
+        )
 
 
 class CircuitBreakerFactory:

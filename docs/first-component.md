@@ -181,6 +181,17 @@ The testing package also exports `ManualClock`, `InstantClock`,
 `FakeSettingsResolver`, an in-memory state store, and scenarios
 (`always_transient`, `always_permanent`, `always_times_out`, `hangs`).
 
+Installing warpweft also registers a small pytest plugin, so two fixtures are
+available with no setup - `instant_clock` and `manual_clock`, each a fresh
+clock per test:
+
+```python
+async def test_get_recovers(instant_clock):
+    outcome = await drive(profiles, "get", clock=instant_clock, user_id="42")
+    assert outcome.attempts == 3
+    assert instant_clock.slept  # virtual backoff, zero real time
+```
+
 ## Where next
 
 - [composition.md](composition.md) - dependencies, lifecycle, per-tenant slices,
