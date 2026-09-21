@@ -187,6 +187,22 @@ def test_action_class_tags_reach_the_tool_filter() -> None:
     assert binding.meta.tags == frozenset({"admin"})
 
 
+def test_action_background_flag_reaches_the_tool_meta() -> None:
+    class Crunch(Action[EmptySettings, Ping, int]):
+        background = True
+
+        async def execute(self, params: Ping) -> int:
+            return params.value
+
+    (binding,) = collect_tools(app_with(Crunch))
+    assert binding.meta.background is True
+
+
+def test_action_is_foreground_by_default() -> None:
+    (binding,) = collect_tools(app_with(Summarize))
+    assert binding.meta.background is False
+
+
 def test_action_can_opt_out_of_exposure() -> None:
     class Hidden(Action[EmptySettings, Ping, int]):
         entrypoint = False
