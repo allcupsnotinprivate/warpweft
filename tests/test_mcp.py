@@ -212,6 +212,33 @@ async def test_call_reports_outcome_metadata(connect) -> None:
     assert result.meta["warpweft.degraded"] is False
 
 
+async def test_degraded_call_reports_meta(connect) -> None:
+    from warpweft.core.component import Criticality
+    from warpweft.core.context import InvocationContext
+
+    class Weather(AComponent[EmptySettings, str, dict]):
+        name = "weather"
+        criticality = Criticality.OPTIONAL
+
+        def stub(self, ctx: InvocationContext) -> dict:
+            return {"temp": None}
+
+        @tool(description="Current weather.", read_only=True)
+        @invocable
+        async def current(self, city: str) -> dict:
+            raise TransientError("upstream down")
+
+    reg = Registry()
+    reg.register(Weather)
+    app = App(registry=reg, config={"weather": {"policy": {"degradation": {}}}})
+    async with connect(app) as client:
+        result = await client.call_tool("weather__current", {"city": "paris"})
+    assert result.is_error is False
+    assert result.meta is not None
+    assert result.meta["warpweft.degraded"] is True
+    assert result.meta["warpweft.source"] == "stub"
+
+
 async def test_unknown_tool_is_an_error(connect) -> None:
     async with connect(app_with(Search)) as client:
         result = await client.call_tool("search__ghost", {})

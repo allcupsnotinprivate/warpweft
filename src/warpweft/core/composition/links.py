@@ -1,8 +1,10 @@
 """Building link factories from validated settings.
 
 Maps a link name to a builder that turns its settings model into a factory.
-Degradation is deliberately absent: it is not part of the ordered policy
-chain and is wired separately for optional components.
+Degradation is deliberately absent from the builders: it is not an ordered
+link but is wired at a fixed position around the whole chain by
+``warpweft.core.composition.wiring.degradation_interceptor`` (gated on
+criticality + a ``stub()`` method + ``policy.degradation`` config).
 """
 
 from collections.abc import Callable, Mapping

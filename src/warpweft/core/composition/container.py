@@ -38,7 +38,7 @@ from warpweft.core.errors import (
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.builtin.circuit_breaker import CircuitBreakerInterceptor
 from warpweft.core.pipeline.builtin.concurrency import ConcurrencyInterceptor
-from warpweft.core.pipeline.chain import build_chain
+from warpweft.core.pipeline.chain import build_chain, compose
 from warpweft.core.pipeline.interceptor import Next
 from warpweft.core.pipeline.state import InMemoryStateStore
 from warpweft.core.telemetry.instrument import DEFAULT_CONFIG, TelemetryConfig, instrument
@@ -63,7 +63,13 @@ from .introspection import (
     RuntimeSnapshot,
 )
 from .registry import Registry
-from .wiring import active_links, make_base, method_factories
+from .wiring import (
+    active_links,
+    degradation_interceptor,
+    make_base,
+    method_factories,
+    validate_degradation,
+)
 
 C = TypeVar("C", bound=AComponent[Any, Any, Any])
 
@@ -191,7 +197,7 @@ class Container:
             component_cls = registry.get(name)
             descriptor = registry.descriptor(name)
             # Fail fast on deployment errors (without the per-slice layer).
-            assemble_config(
+            config, _ = assemble_config(
                 name,
                 descriptor.config_model,
                 [
@@ -200,6 +206,7 @@ class Container:
                     (SOURCE_DEPLOYMENT, dict(raw)),
                 ],
             )
+            validate_degradation(name, component_cls, config)
             registrations[name] = _Registration(name, component_cls, descriptor, dict(raw))
 
         graph = DependencyGraph(
@@ -409,6 +416,7 @@ class Container:
                 (SOURCE_SLICE, dict(self._resolver.resolve(name, scope_key))),
             ],
         )
+        validate_degradation(name, reg.cls, config)  # a slice override may add the block
         self._config_cache[(name, scope_key)] = config
         self._provenance_cache[(name, scope_key)] = provenance
         return config
@@ -427,6 +435,12 @@ class Container:
         factories = method_factories(config, spec.policy, self._clock, self._classifier)
         base = make_base(instance, spec)
         chain = build_chain(factories, self._link_store, self._axes, base)
+        degradation = degradation_interceptor(config, spec.policy, instance, self._classifier)
+        if degradation is not None:
+            # Fixed position: outside the whole ordered chain (a stub is never
+            # cached or retried), inside instrument() (so source/degraded and the
+            # degradations counter reflect the substitution).
+            chain = compose((degradation,), chain)
         return instrument(
             chain,
             clock=self._clock,

@@ -78,6 +78,55 @@ outside. The base call binds the method, passing arguments from the context and
 injecting the context itself if the method declares an `InvocationContext`
 parameter.
 
+## Graceful degradation
+
+An **optional** component can answer from a fallback when its real call is
+unavailable, instead of failing the caller. Three things must line up:
+
+- `criticality = Criticality.OPTIONAL` on the component,
+- a `stub(self, ctx)` method returning the fallback value (switch on
+  `ctx.operation` / `ctx.arguments` for per-method values), and
+- a `policy.degradation` block in config to turn it on.
+
+```python
+class Weather(AComponent[WeatherSettings, str, dict]):
+    criticality = Criticality.OPTIONAL
+
+    @invocable
+    async def current(self, city: str) -> dict: ...
+
+    def stub(self, ctx: InvocationContext) -> dict:
+        return {"city": ctx.arguments["city"], "temp": None, "stale": True}
+
+
+# config: {"weather": {"policy": {"degradation": {}}}}
+```
+
+On an *unavailability* failure - a transient error, an exhausted retry, an open
+breaker, a blown deadline - the outcome is replaced by `stub(ctx)`, carrying
+`source = "stub"` and `degraded = True` (and the `warpweft.degradations`
+counter moves). A *permanent* error (a bad request) is never masked - it
+surfaces. `degrade_on` in the config flips which error class degrades.
+
+Any other combination is a **build-time error**, not a silent no-op:
+`Container.build` rejects `policy.degradation` on a `required` component
+(*"only an optional component may serve a stub"*), and rejects it when no
+`stub()` is defined (*"defines no stub() method"*). A per-tenant config
+override can enable degradation for one slice; the same checks run when that
+slice is first used.
+
+The stub must be **synchronous**: a fallback is a constant or a last-known-good
+value, not a second dependency doing I/O. If the stub itself raises, that
+exception propagates (with the original failure as context) - a broken stub is
+loud, never swallowed.
+
+Degradation is **not** an ordered link. Like telemetry it sits at a fixed
+position - outside the whole chain, so a stub is never cached or retried, but
+inside instrumentation, so the substitution is counted. It never appears in
+`policy.chain` or `explain()`. Note this covers call-time failures of a
+*running* component; an optional component that failed to **start** is
+`ComponentUnavailable` on invoke, not stubbed.
+
 ## The endpoint axis (axes in action)
 
 The built-in `endpoint` axis reflects which external system the current
