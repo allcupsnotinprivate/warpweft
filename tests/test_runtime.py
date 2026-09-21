@@ -8,7 +8,7 @@ import anyio
 from pydantic import BaseModel
 import pytest
 
-from warpweft.core.axes import ScopeSpec
+from warpweft.core.axes import AxisRegistry, ScopeSpec
 from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Registry
 from warpweft.core.errors import ConfigurationError, DeadlineExceeded, TransientError
@@ -289,6 +289,13 @@ async def test_required_axis_without_a_value_errors_on_use() -> None:
     async with app.run():
         with pytest.raises(ConfigurationError, match="required but has no value"):
             await app.get(PerTenant)
+
+
+def test_app_axis_passes_max_cardinality() -> None:
+    axes = AxisRegistry()
+    app = App(registry=Registry(), axes=axes)
+    app.axis("tenant", default="public", max_cardinality=5)
+    assert axes.get("tenant").max_cardinality == 5
 
 
 # --- budget & correlation ----------------------------------------------------

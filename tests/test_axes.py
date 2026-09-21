@@ -1,5 +1,7 @@
 """Axes: canonicalization, required/default semantics, registry validation."""
 
+import logging
+
 import pytest
 
 from warpweft.core.axes import GLOBAL_SCOPE, Axis, AxisRegistry, ScopeSpec
@@ -83,3 +85,45 @@ def test_scope_key_is_hashable_dict_key() -> None:
     key = registry.resolve(ScopeSpec(["a", "b"]))
     state = {key: object()}
     assert state[registry.resolve(ScopeSpec(["b", "a"]))] is state[key]
+
+
+def test_cardinality_warning_fires_once(caplog: pytest.LogCaptureFixture) -> None:
+    """The soft cap warns exactly once per axis, and never blocks resolution."""
+    current = ["a"]
+    registry = AxisRegistry()
+    registry.register(Axis(name="user", resolver=lambda: current[0], max_cardinality=2))
+
+    with caplog.at_level(logging.WARNING, logger="warpweft.core.axes"):
+        for value in ("a", "b", "c", "d", "a"):
+            current[0] = value
+            # Resolution stays soft: every value still yields a valid key.
+            assert registry.resolve(ScopeSpec(["user"])) == (("user", value),)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "user" in warnings[0].getMessage()
+    assert "max_cardinality" in warnings[0].getMessage()
+
+
+def test_repeated_values_do_not_count_toward_cap(caplog: pytest.LogCaptureFixture) -> None:
+    registry = AxisRegistry()
+    registry.register(Axis(name="region", resolver=lambda: "eu", max_cardinality=1))
+
+    with caplog.at_level(logging.WARNING, logger="warpweft.core.axes"):
+        for _ in range(5):
+            registry.resolve(ScopeSpec(["region"]))
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_no_warning_within_cap(caplog: pytest.LogCaptureFixture) -> None:
+    current = ["a"]
+    registry = AxisRegistry()
+    registry.register(Axis(name="user", resolver=lambda: current[0], max_cardinality=2))
+
+    with caplog.at_level(logging.WARNING, logger="warpweft.core.axes"):
+        for value in ("a", "b"):
+            current[0] = value
+            registry.resolve(ScopeSpec(["user"]))
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
