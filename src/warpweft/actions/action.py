@@ -106,6 +106,8 @@ class Action(AComponent[TSettings, TIn, TOut]):
     open_world: ClassVar[bool | None] = None
     #: Tool tags, for serving different tool sets from one app.
     tags: ClassVar[Collection[str] | None] = None
+    #: Expose as a non-blocking background tool (submit + poll); see ``@tool``.
+    background: ClassVar[bool] = False
 
     _invoker: Callable[..., Awaitable[Outcome[Any]]] | None = None
 
@@ -127,6 +129,7 @@ class Action(AComponent[TSettings, TIn, TOut]):
                 idempotent=cls.idempotent,
                 open_world=cls.open_world,
                 tags=cls.tags,
+                background=cls.background,
             )(execute)
 
     async def execute(self, params: TIn) -> TOut:
