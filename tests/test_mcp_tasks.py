@@ -53,7 +53,6 @@ def record(clock: ManualClock, task_id: str = "t1", *, ttl_ms: int | None = DEFA
         created_at=now,
         last_updated_at=now,
         ttl_ms=ttl_ms,
-        poll_interval_ms=500,
     )
 
 
@@ -127,14 +126,25 @@ async def poll_store(store: InMemoryTaskStore, task_id: str, status: str) -> Tas
 
 
 async def test_runner_mints_ids_and_runs_to_completion() -> None:
-    async with task_runner(clock=ManualClock()) as runner:
+    counter = iter(range(1, 10))
+    factory = lambda: f"task-{next(counter)}"  # noqa: E731 - test-local
+    async with task_runner(clock=ManualClock(), id_factory=factory) as runner:
         result = ok("value")
         rec = await runner.start("demo", const_job(result), ttl_ms=DEFAULT_TTL_MS)
-        assert rec.task_id == "task-1"  # deterministic counter
+        assert rec.task_id == "task-1"  # from the injected factory
         assert rec.status == "working"  # durably created before returning
 
-        done = await poll_store(runner.store, "task-1", "completed")  # type: ignore[arg-type]
+        done = await poll_store(runner.store, rec.task_id, "completed")  # type: ignore[arg-type]
         assert done.result is result
+
+
+async def test_default_ids_are_unique_across_runners() -> None:
+    # The default uuid factory keeps ids unique even for runners sharing a store,
+    # so records don't clobber each other (the old per-runner counter collided).
+    async with task_runner(clock=ManualClock()) as a, task_runner(clock=ManualClock()) as b:
+        rec_a = await a.start("demo", const_job(ok()), ttl_ms=None)
+        rec_b = await b.start("demo", const_job(ok()), ttl_ms=None)
+        assert rec_a.task_id != rec_b.task_id
 
 
 async def test_runner_marks_error_result_as_failed() -> None:

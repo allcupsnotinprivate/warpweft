@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Protocol
+from uuid import uuid4
 
 import anyio
 import anyio.abc
@@ -33,10 +34,8 @@ from pydantic import BaseModel
 
 from warpweft.core.clock import Clock, SystemClock
 
-#: Default retention and suggested poll cadence, in milliseconds. A client may
-#: request a shorter TTL via the augmentation; it can never extend past this.
+#: Default retention for a task, in milliseconds, measured from creation.
 DEFAULT_TTL_MS = 5 * 60 * 1000
-DEFAULT_POLL_INTERVAL_MS = 500
 
 #: A task in a terminal state never changes again.
 TERMINAL: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled"})
@@ -52,7 +51,6 @@ class TaskRecord:
     created_at: datetime
     last_updated_at: datetime
     ttl_ms: int | None
-    poll_interval_ms: int | None
     status_message: str | None = None
     #: The final ``tools/call`` payload, retained for ``task_result``.
     result: mt.CallToolResult | None = None
@@ -171,10 +169,9 @@ class TaskRunner:
     nursery is cancelled and every outstanding job unwinds through its policy
     chain.
 
-    ``id_factory`` mints task ids. The default is a per-runner monotonic counter
-    (``task-1``, ``task-2``, ...), which keeps tests deterministic; a deployment
-    running several servers against one shared store should pass a
-    globally-unique factory (e.g. ``uuid4``).
+    ``id_factory`` mints task ids. The default is a random ``uuid4`` hex, which
+    stays unique even when several runners share one store; pass a factory for a
+    deterministic scheme in tests or a store-specific id format.
     """
 
     def __init__(
@@ -189,16 +186,11 @@ class TaskRunner:
         self._store = store
         self._clock = clock
         self._scopes: dict[str, anyio.CancelScope] = {}
-        self._counter = 0
-        self._id_factory = id_factory or self._counter_id
+        self._id_factory = id_factory or (lambda: uuid4().hex)
 
     @property
     def store(self) -> TaskStore:
         return self._store
-
-    def _counter_id(self) -> str:
-        self._counter += 1
-        return f"task-{self._counter}"
 
     async def start(self, tool: str, job: TaskJob, *, ttl_ms: int | None) -> TaskRecord:
         """Mint an id, durably create the task, then spawn it.
@@ -217,7 +209,6 @@ class TaskRunner:
             created_at=now,
             last_updated_at=now,
             ttl_ms=ttl_ms,
-            poll_interval_ms=DEFAULT_POLL_INTERVAL_MS,
         )
         await self._store.create(record)
         scope = anyio.CancelScope()

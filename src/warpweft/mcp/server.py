@@ -254,8 +254,8 @@ def _task_result_output_schema(bindings: list[ToolBinding]) -> dict[str, Any]:
     """The ``task_result`` output schema: a union of every background op's result.
 
     Each background result is stored wrapped as ``{"result": <value>}`` (see
-    `_background_result`), so the advertised schema is that wrapper with the
-    inner value constrained to the ``oneOf`` of the ops' raw output schemas.
+    `_result`), so the advertised schema is that wrapper with the inner value
+    constrained to the ``oneOf`` of the ops' raw output schemas.
     """
     members: list[dict[str, Any]] = []
     all_defs: dict[str, Any] = {}
@@ -313,30 +313,28 @@ def _serialize(binding: ToolBinding, value: Any) -> Any:
     return binding.spec.output_adapter.dump_python(value, mode="json")
 
 
+def _result(binding: ToolBinding, outcome: Any, *, wrap: bool) -> mt.CallToolResult:
+    """Serialize an invoke outcome into a ``CallToolResult``.
+
+    Text stays the raw serialization (readable for humans). ``wrap`` controls
+    the structured content: an inline call wraps only when its advertised schema
+    is the ``{"result": ...}`` wrapper (a non-object return), while a background
+    result always wraps so ``task_result`` has one uniform union schema.
+    """
+    serialized = _serialize(binding, outcome.value)
+    text = serialized if isinstance(serialized, str) else json.dumps(serialized)
+    return mt.CallToolResult(
+        content=[mt.TextContent(type="text", text=text)],
+        structured_content={"result": serialized} if wrap else serialized,
+        meta={"warpweft.source": outcome.source, "warpweft.degraded": outcome.degraded},
+    )
+
+
 def _success_result(binding: ToolBinding, outcome: Any) -> mt.CallToolResult:
-    """Build the inline success result. Text stays the raw serialization; the
-    wrap decision follows the advertised schema, not the runtime value, so
-    structured content always conforms to the output schema."""
-    serialized = _serialize(binding, outcome.value)
-    text = serialized if isinstance(serialized, str) else json.dumps(serialized)
+    """Build the inline success result; the wrap decision follows the advertised
+    schema, not the runtime value, so structured content always conforms."""
     _, wrapped = _output_contract(binding)
-    return mt.CallToolResult(
-        content=[mt.TextContent(type="text", text=text)],
-        structured_content={"result": serialized} if wrapped else serialized,
-        meta={"warpweft.source": outcome.source, "warpweft.degraded": outcome.degraded},
-    )
-
-
-def _background_result(binding: ToolBinding, outcome: Any) -> mt.CallToolResult:
-    """The stored result for a background op, always wrapped as ``{"result": ...}``
-    so ``task_result`` has one uniform (union) output schema across all ops."""
-    serialized = _serialize(binding, outcome.value)
-    text = serialized if isinstance(serialized, str) else json.dumps(serialized)
-    return mt.CallToolResult(
-        content=[mt.TextContent(type="text", text=text)],
-        structured_content={"result": serialized},
-        meta={"warpweft.source": outcome.source, "warpweft.degraded": outcome.degraded},
-    )
+    return _result(binding, outcome, wrap=wrapped)
 
 
 def _status_result(view: TaskStatusView) -> mt.CallToolResult:
@@ -491,7 +489,8 @@ async def _submit(app: App, runner: TaskRunner, binding: ToolBinding, kwargs: di
                 outcome = await app.container.invoke(binding.component, binding.method, **kwargs)
         except Exception as exc:
             return error_result(exc)
-        return _background_result(binding, outcome)
+        # Always wrap: task_result advertises one union schema over {"result": ...}.
+        return _result(binding, outcome, wrap=True)
 
     record = await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS)
     task_id = {"task_id": record.task_id}
