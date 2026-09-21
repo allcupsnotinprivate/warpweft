@@ -11,9 +11,10 @@ error-status call counts; they attach to the duration histogram and ok-status
 call counts only for values in the allowlist.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import logging
 from typing import Any, Final
 
 from opentelemetry import metrics, trace
@@ -34,6 +35,18 @@ from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.interceptor import Next
 
 from . import conventions as conv
+
+logger = logging.getLogger(__name__)
+
+#: Host hook to enrich the invocation span with application attributes.
+#:
+#: Called once at the end of an invocation: on success as
+#: ``(span, ctx, outcome, None)``, on error as ``(span, ctx, None, exc)``.
+#: It runs after the framework's own attributes are set; failures inside it are
+#: swallowed (logged at ``debug``) so enrichment never breaks a call. This keeps
+#: warpweft vendor-neutral: mapping ``ctx.arguments``/``outcome.value`` onto a
+#: tracing vendor's conventions is the host's business, not the framework's.
+SpanEnricher = Callable[[trace.Span, InvocationContext, Outcome[Any] | None, BaseException | None], None]
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,7 @@ def instrument(
     meter_provider: metrics.MeterProvider | None = None,
     classifier: ErrorClassifier | None = None,
     config: TelemetryConfig = DEFAULT_CONFIG,
+    span_enricher: SpanEnricher | None = None,
 ) -> Next:
     """Wrap ``next_`` with the invocation span and the metrics contract.
 
@@ -112,6 +126,12 @@ def instrument(
     application configures an SDK - so wrapping is always safe and nearly
     free. The clock resolves per call: this parameter, else ``ctx.clock``,
     else a process-wide system clock.
+
+    ``span_enricher`` is an optional host hook invoked once at the end of an
+    invocation (on success as ``(span, ctx, outcome, None)``, on error as
+    ``(span, ctx, None, exc)``) to attach application attributes to the
+    invocation span. Its failures are swallowed and logged at ``debug``;
+    cancellation bypasses it, as it bypasses the metrics.
     """
     tracer = (tracer_provider or trace.get_tracer_provider()).get_tracer(conv.INSTRUMENTATION_NAME, __version__)
     meter = (meter_provider or metrics.get_meter_provider()).get_meter(conv.INSTRUMENTATION_NAME, __version__)
@@ -155,6 +175,11 @@ def instrument(
                 elapsed = resolved_clock.monotonic() - started
                 error_class = error_classifier.classify(exc).value
                 span.set_attribute(conv.ATTR_ERROR_CLASS, error_class)
+                if span_enricher is not None:
+                    try:
+                        span_enricher(span, ctx, None, exc)
+                    except Exception:  # enrichment must never break the call
+                        logger.debug("span_enricher raised on the error path", exc_info=True)
                 calls.add(
                     1,
                     {
@@ -187,6 +212,11 @@ def instrument(
                 duration.record(elapsed, {**operation_attr, conv.ATTR_STATUS: conv.STATUS_OK, **axes_allowed})
                 if outcome.degraded:
                     degradations.add(1, {**operation_attr, **axes_all})
+                if span_enricher is not None:
+                    try:
+                        span_enricher(span, ctx, outcome, None)
+                    except Exception:  # enrichment must never break the call
+                        logger.debug("span_enricher raised on the success path", exc_info=True)
                 return outcome
             finally:
                 if previous is _MISSING:

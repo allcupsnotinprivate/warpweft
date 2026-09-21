@@ -79,6 +79,45 @@ operation/axes - bounded). **Manual** transitions via
 `Container.force_open_breakers` / `reset_breakers` happen outside any
 invocation and are logged only - no metric point.
 
+## Enriching the invocation span
+
+The framework attaches only its own vendor-neutral attributes. To record
+application data - a call's input and output, a tenant's plan, a tracing
+vendor's conventions (Langfuse, etc.) - pass a `span_enricher` host hook. It is
+a callable
+
+```python
+(span, ctx, outcome, exc) -> None
+```
+
+invoked **once at the end** of every invocation:
+
+- on success as `(span, ctx, outcome, None)` - after the framework's own
+  attributes are set, right before the outcome is returned;
+- on error as `(span, ctx, None, exc)` - after `warpweft.error.class` is set,
+  right before the exception propagates.
+
+Map `ctx.arguments` (bound input) and `outcome.value` (output) onto whatever
+attributes your tracing backend expects; warpweft stays vendor-neutral. The
+hook's failures are **swallowed** (logged at `debug`) so enrichment can never
+break a call, and **cancellation bypasses it**, just as it bypasses the
+metrics.
+
+Pass it wherever the wrapper is configured - directly to `instrument`, or
+through the container / app, which forward it to `instrument`:
+
+```python
+def enrich(span, ctx, outcome, exc):
+    if outcome is not None:
+        span.set_attribute("app.output", outcome.value)
+
+
+wrapped = instrument(chain, span_enricher=enrich)
+# or, end to end:
+app = App(span_enricher=enrich)  # forwarded to Container.build
+container = Container.build(registry, configs, span_enricher=enrich)
+```
+
 ## Cardinality policy
 
 Axis values as metric attributes are the classic way to explode a time-series
