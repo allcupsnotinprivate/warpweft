@@ -9,7 +9,7 @@ Logging is deliberately sparse and complements telemetry rather than
 duplicating it: per-call detail lives in OpenTelemetry spans/metrics (see
 [telemetry.md](telemetry.md)); logs cover coarse lifecycle and diagnostic
 events (container start/stop, a component degrading at startup, a circuit
-breaker opening/closing).
+breaker opening/closing, a call degrading to a stub).
 
 ## Logger names
 

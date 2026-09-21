@@ -42,6 +42,9 @@ Everything else is **opt-in**, added only when you need it:
 - `endpoint()` - return the resolved host when several instances talk to the
   same system and should *share* breaker/concurrency state; by default each
   instance keeps its own.
+- `stub(ctx)` - a synchronous fallback value served during an outage of an
+  `optional` component, activated by a `policy.degradation` config block; see
+  [composition.md](composition.md).
 - a typed dependency - annotate an attribute with another component's type and
   the container injects the live instance:
 

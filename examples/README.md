@@ -5,3 +5,4 @@
 - `testing_a_component.py` - testing a component with `warpweft.testing` (drive + failure scenarios).
 - `mcp_tools.py` - exposing `@tool` invocables over MCP (with the `mcp` extra).
 - `telemetry_console.py` - OTel SDK console exporters around an App: spans + metrics on stdout (needs `opentelemetry-sdk`).
+- `degradation.py` - graceful degradation: an optional component answers from its `stub()` during an outage (`criticality` + `stub()` + `policy.degradation`).
