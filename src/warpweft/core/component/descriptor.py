@@ -21,6 +21,7 @@ from warpweft.core.axes import ScopeSpec
 from warpweft.core.pipeline.builtin.cache import CacheSettings
 from warpweft.core.pipeline.builtin.circuit_breaker import CircuitBreakerSettings
 from warpweft.core.pipeline.builtin.concurrency import ConcurrencySettings
+from warpweft.core.pipeline.builtin.degradation import DegradationSettings
 from warpweft.core.pipeline.builtin.retry import RetrySettings
 from warpweft.core.pipeline.builtin.timeout import TimeoutSettings
 from warpweft.core.pipeline.chain import DEFAULT_ORDER
@@ -49,6 +50,7 @@ BUILTIN_LINK_MODELS: Mapping[str, type[BaseModel]] = MappingProxyType(
         "circuit_breaker": CircuitBreakerSettings,
         "retry": RetrySettings,
         "timeout": TimeoutSettings,
+        "degradation": DegradationSettings,
     }
 )
 

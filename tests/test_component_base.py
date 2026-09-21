@@ -53,6 +53,14 @@ async def test_lifecycle_defaults_are_noops_and_healthy() -> None:
     assert (await c.health()).is_ok
 
 
+async def test_base_stub_raises_until_overridden() -> None:
+    from warpweft.core.context import InvocationContext
+
+    c = Sample(Settings(url="http://h"))
+    with pytest.raises(NotImplementedError, match="no stub"):
+        c.stub(InvocationContext(operation="op", correlation_id="cid"))
+
+
 async def test_settings_is_a_typed_instance_field() -> None:
     s = Settings(url="http://h")
     c = Sample(s)

@@ -1,11 +1,11 @@
 """Degradation link: stub on unavailability, loud on real errors, counted."""
 
+import logging
 from typing import Any
 
 from pydantic import ValidationError
 import pytest
 
-from warpweft.core.axes import EMPTY_SCOPE
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import (
     CircuitOpen,
@@ -17,7 +17,6 @@ from warpweft.core.errors import (
 )
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.builtin.degradation import (
-    DegradationFactory,
     DegradationInterceptor,
     DegradationSettings,
 )
@@ -126,11 +125,24 @@ async def test_settings_default_degrade_on_is_transient() -> None:
         DegradationSettings(degrade_on="nonsense")  # type: ignore[arg-type]
 
 
-async def test_factory_scope_and_creation() -> None:
-    factory = DegradationFactory(DegradationSettings(), lambda c: "stub")
-    assert factory.state_scope == EMPTY_SCOPE
+async def test_stub_exception_propagates_with_original_as_context() -> None:
+    def boom(c: InvocationContext) -> Any:
+        raise RuntimeError("stub is broken")
 
-    inst = factory.create(())
-    outcome = await inst.call(raiser(TransientError("down")), ctx())
-    assert outcome.source == "stub"
-    assert outcome.value == "stub"
+    cb = link(stub=boom)
+    original = TransientError("down")
+    with pytest.raises(RuntimeError) as excinfo:
+        await cb.call(raiser(original), ctx())
+    assert excinfo.value.__context__ is original
+    # The call was counted before the stub ran.
+    assert cb.degraded_count == 1
+
+
+async def test_first_substitution_warns_then_debug(caplog: pytest.LogCaptureFixture) -> None:
+    cb = link(stub="s")
+    logger_name = "warpweft.core.pipeline.builtin.degradation"
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        await cb.call(raiser(TransientError("down")), ctx())
+        await cb.call(raiser(TransientError("down")), ctx())
+    records = [r for r in caplog.records if r.name == logger_name]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]

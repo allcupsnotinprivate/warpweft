@@ -6,7 +6,7 @@ running system.
 """
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from warpweft.core.axes import GLOBAL_SCOPE, AxisRegistry, ScopeKey
 from warpweft.core.clock import Clock
@@ -15,11 +15,18 @@ from warpweft.core.component.descriptor import BUILTIN_LINK_MODELS
 from warpweft.core.component.policy import EffectivePolicy
 from warpweft.core.component.settings import build_config_model
 from warpweft.core.composition.endpoint import endpoint_axis, use_endpoint
-from warpweft.core.composition.wiring import make_base, method_factories
+from warpweft.core.composition.wiring import (
+    degradation_interceptor,
+    link_settings,
+    make_base,
+    method_factories,
+    validate_degradation,
+)
 from warpweft.core.context import InvocationContext, use_context
-from warpweft.core.errors import DefaultErrorClassifier, ErrorClassifier
+from warpweft.core.errors import ConfigurationError, DefaultErrorClassifier, ErrorClassifier
 from warpweft.core.outcome import Outcome
-from warpweft.core.pipeline.chain import DEFAULT_ORDER, build_chain
+from warpweft.core.pipeline.builtin.degradation import DegradationInterceptor, DegradationSettings, StubProvider
+from warpweft.core.pipeline.chain import DEFAULT_ORDER, build_chain, compose
 from warpweft.core.pipeline.interceptor import Next
 from warpweft.core.pipeline.state import InMemoryStateStore
 
@@ -38,13 +45,33 @@ async def _run(
     arguments: Mapping[str, Any] | None,
     scope_key: ScopeKey,
     endpoint: str,
+    component: AComponent[Any, Any, Any] | None = None,
+    stub: StubProvider | None = None,
 ) -> Outcome[Any]:
     clock = clock or InstantClock()
+    resolved = classifier or DefaultErrorClassifier()
     config = _POLICY_ONLY_MODEL.model_validate({"policy": dict(policy)})
-    factories = method_factories(config, effective, clock, classifier or DefaultErrorClassifier())
+    factories = method_factories(config, effective, clock, resolved)
     axes = AxisRegistry()
     axes.register(endpoint_axis())
     chain = build_chain(factories, InMemoryStateStore(), axes, base)
+    degradation: DegradationInterceptor | None = None
+    if component is not None:
+        # drive(): mirror the container's build-time gating and wiring.
+        validate_degradation(component.name, type(component), config)
+        degradation = degradation_interceptor(config, effective, component, resolved)
+    else:
+        # drive_policy(): a synthetic stub opts degradation in; the key without
+        # a stub is an error, mirroring the build contract's fail-loud rule.
+        settings = link_settings(config, "degradation", {})
+        if settings is not None and stub is None:
+            raise ConfigurationError(
+                "policy configures degradation but drive_policy was given no stub= to fall back to"
+            )
+        if settings is not None and stub is not None:
+            degradation = DegradationInterceptor(cast(DegradationSettings, settings), stub, resolved)
+    if degradation is not None:
+        chain = compose((degradation,), chain)
     ctx = InvocationContext(
         operation="harness",
         correlation_id="test",
@@ -86,6 +113,7 @@ async def drive(
         arguments=arguments,
         scope_key=scope_key,
         endpoint=endpoint,
+        component=component,
     )
 
 
@@ -98,12 +126,15 @@ async def drive_policy(
     arguments: Mapping[str, Any] | None = None,
     scope_key: ScopeKey = GLOBAL_SCOPE,
     endpoint: str = "test",
+    stub: StubProvider | None = None,
 ) -> Outcome[Any]:
     """Run a scripted base call through a chain built from a ``policy`` dict.
 
     All configured links are active (the full default order); use the
     `~warpweft.core.testing.scenarios` builders for ``base`` to check how a
-    policy behaves against a misbehaving service.
+    policy behaves against a misbehaving service. Pass ``stub`` to activate
+    degradation when ``policy`` includes a ``degradation`` block - the stub is
+    the fallback; the block without a stub is a `ConfigurationError`.
     """
     effective = EffectivePolicy(chain=DEFAULT_ORDER, overrides={})
     return await _run(
@@ -115,4 +146,5 @@ async def drive_policy(
         arguments=arguments,
         scope_key=scope_key,
         endpoint=endpoint,
+        stub=stub,
     )

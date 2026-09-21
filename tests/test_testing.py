@@ -1,9 +1,12 @@
 """The public testing helpers: instant clock, scenarios, drive/drive_policy."""
 
+from typing import Any
+
 import pytest
 
-from warpweft.core.component import AComponent, EmptySettings, invocable
-from warpweft.core.errors import AttemptTimeout, PermanentError, RetryExhausted, TransientError
+from warpweft.core.component import AComponent, Criticality, EmptySettings, invocable
+from warpweft.core.context import InvocationContext
+from warpweft.core.errors import AttemptTimeout, ConfigurationError, PermanentError, RetryExhausted, TransientError
 from warpweft.core.testing import (
     DictSettingsResolver,
     FakeSettingsResolver,
@@ -89,6 +92,66 @@ async def test_drive_without_a_policy_is_a_bare_call() -> None:
     with pytest.raises(TransientError):  # no retry configured, first failure escapes
         await drive(component, "fetch")
     assert component.calls == 1
+
+
+class OptionalFlaky(AComponent[EmptySettings, None, Any]):
+    name = "optional-flaky"
+    criticality = Criticality.OPTIONAL
+
+    def stub(self, ctx: InvocationContext) -> Any:
+        return "stubbed"
+
+    @invocable
+    async def fetch(self) -> Any:
+        raise TransientError("down")
+
+
+async def test_drive_degrades_an_optional_component_with_a_stub() -> None:
+    outcome = await drive(OptionalFlaky(EmptySettings()), "fetch", config={"policy": {"degradation": {}}})
+    assert outcome.value == "stubbed"
+    assert outcome.source == "stub"
+    assert outcome.degraded is True
+
+
+async def test_drive_mirrors_build_time_degradation_errors() -> None:
+    class RequiredFlaky(AComponent[EmptySettings, None, Any]):
+        name = "required-flaky"
+
+        def stub(self, ctx: InvocationContext) -> Any:
+            return "stubbed"
+
+        @invocable
+        async def fetch(self) -> Any:
+            raise TransientError("down")
+
+    class OptionalNoStub(AComponent[EmptySettings, None, Any]):
+        name = "optional-nostub-drive"
+        criticality = Criticality.OPTIONAL
+
+        @invocable
+        async def fetch(self) -> Any:
+            raise TransientError("down")
+
+    with pytest.raises(ConfigurationError, match="only an optional component"):
+        await drive(RequiredFlaky(EmptySettings()), "fetch", config={"policy": {"degradation": {}}})
+    with pytest.raises(ConfigurationError, match="defines no stub"):
+        await drive(OptionalNoStub(EmptySettings()), "fetch", config={"policy": {"degradation": {}}})
+
+
+async def test_drive_policy_with_stub_substitutes() -> None:
+    outcome = await drive_policy({"degradation": {}}, always_transient(), stub=lambda ctx: "fallback")
+    assert outcome.value == "fallback"
+    assert outcome.source == "stub"
+
+
+async def test_drive_policy_degradation_without_stub_is_an_error() -> None:
+    with pytest.raises(ConfigurationError, match="no stub="):
+        await drive_policy({"degradation": {}}, always_transient())
+
+
+async def test_drive_policy_stub_without_config_is_inert() -> None:
+    with pytest.raises(TransientError):  # no degradation block: the stub never fires
+        await drive_policy({}, always_transient(), stub=lambda ctx: "fallback")
 
 
 async def test_reexports_are_wired() -> None:

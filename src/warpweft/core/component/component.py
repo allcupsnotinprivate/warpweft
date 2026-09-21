@@ -21,6 +21,7 @@ from typing import Any, ClassVar, Generic, TypeVar, get_args, get_origin, get_ty
 from pydantic import BaseModel
 
 from warpweft.core.axes import EMPTY_SCOPE, ScopeSpec
+from warpweft.core.context import InvocationContext
 from warpweft.core.outcome import Outcome
 from warpweft.core.unit import Identity
 
@@ -145,6 +146,20 @@ class AComponent(Generic[TSettings, TIn, TOut]):
         """
         return None
 
+    def stub(self, ctx: InvocationContext) -> Any:
+        """Fallback value for a degraded call (optional; define it to enable degradation).
+
+        Wired only when the component's ``criticality`` is ``optional`` **and**
+        ``policy.degradation`` is configured. One stub per component: switch on
+        ``ctx.operation`` / ``ctx.arguments`` for per-method values.
+
+        Deliberately synchronous: a stub must be cheap and local (a constant, a
+        last-known-good value). A stub that does I/O is a second dependency, not
+        a fallback. If the stub itself raises, that exception propagates (with
+        the original failure as context) - a broken stub must be loud.
+        """
+        raise NotImplementedError(f"component '{self.name}' defines no stub()")
+
     @property
     def settings_model(self) -> type[BaseModel] | None:
         """The component's own settings model (for Unit conformance)."""
@@ -192,6 +207,11 @@ def component_dependencies(cls: type["AComponent[Any, Any, Any]"]) -> tuple[str,
         if dep_cls.name not in names:
             names.append(dep_cls.name)
     return tuple(names)
+
+
+def defines_stub(cls: type["AComponent[Any, Any, Any]"]) -> bool:
+    """Whether the class overrides ``AComponent.stub``, enabling degradation."""
+    return cls.stub is not AComponent.stub
 
 
 def settings_model_of(cls: type["AComponent[Any, Any, Any]"]) -> type[BaseModel] | None:
