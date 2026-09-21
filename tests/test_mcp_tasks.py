@@ -6,6 +6,7 @@ task_result and task_cancel are all normal tools returning ``CallToolResult``,
 so they work over the stdio handshake with no special transport.
 """
 
+import json
 from typing import Any
 
 import anyio
@@ -188,6 +189,34 @@ async def test_custom_id_factory() -> None:
         assert rec.task_id == "a"
 
 
+async def test_cancel_before_the_job_starts_is_honored() -> None:
+    # The scope is registered in start() before it returns, so a cancel issued
+    # immediately after start() - before the job has begun running - is not lost
+    # (regression: it used to no-op because the scope wasn't registered yet).
+    proceed = anyio.Event()  # never set: the job hangs unless cancelled
+
+    async def job(task_id: str) -> mt.CallToolResult:
+        await proceed.wait()
+        return ok("never")
+
+    async with task_runner(clock=ManualClock()) as runner:
+        rec = await runner.start("demo", job, ttl_ms=None)
+        await runner.cancel(rec.task_id)
+        settled = await poll_store(runner.store, rec.task_id, "cancelled")  # type: ignore[arg-type]
+        assert settled.status == "cancelled"
+        assert settled.status_message == "cancelled"  # stale progress overwritten
+
+
+async def test_update_does_not_resurrect_an_expired_record() -> None:
+    clock = ManualClock()
+    store = InMemoryTaskStore(clock)
+    await store.create(record(clock, ttl_ms=1000))
+    clock.advance(2.0)  # past TTL
+    # A late progress update must not un-expire the record.
+    await store.update("t1", status="working", status_message="late")
+    assert await store.get("t1") is None
+
+
 # --- wire: background tools over a plain client ------------------------------
 
 
@@ -290,6 +319,58 @@ async def test_task_result_schema_hoists_nested_defs(connect) -> None:
     assert "Line" in schema.get("$defs", {})
 
 
+def _alpha_component() -> type[AComponent[Any, Any, Any]]:
+    class Row(BaseModel):
+        a: int
+
+    class Out(BaseModel):
+        rows: list[Row]
+
+    class Alpha(AComponent[EmptySettings, None, Out]):
+        name = "alpha"
+
+        @tool(background=True)
+        @invocable
+        async def go(self) -> Out:
+            return Out(rows=[])
+
+    return Alpha
+
+
+def _beta_component() -> type[AComponent[Any, Any, Any]]:
+    class Row(BaseModel):  # same class name as Alpha's, different fields
+        b: str
+
+    class Out(BaseModel):
+        rows: list[Row]
+
+    class Beta(AComponent[EmptySettings, None, Out]):
+        name = "beta"
+
+        @tool(background=True)
+        @invocable
+        async def go(self) -> Out:
+            return Out(rows=[])
+
+    return Beta
+
+
+async def test_task_result_union_namespaces_colliding_defs(connect) -> None:
+    # Two ops each nest a model named "Row" with different fields. Hoisting both
+    # into one $defs would clobber one; namespacing by tool name keeps both.
+    app = app_with(_alpha_component(), _beta_component())
+    async with task_runner() as runner, connect(app, runner=runner) as client:
+        listed = await client.list_tools()
+    schema = next(t for t in listed.tools if t.name == "task_result").output_schema
+    assert schema is not None
+    defs = schema["$defs"]
+    assert "a" in defs["alpha__go.Row"]["properties"]  # Alpha's Row survives
+    assert "b" in defs["beta__go.Row"]["properties"]  # Beta's Row survives, un-clobbered
+    dumped = json.dumps(schema)  # each member's $ref points at its own namespaced def
+    assert "#/$defs/alpha__go.Row" in dumped
+    assert "#/$defs/beta__go.Row" in dumped
+
+
 async def test_submit_then_poll_then_result(connect) -> None:
     async with task_runner() as runner, connect(app_with(Reports), runner=runner) as client:
         task_id = await submit(client, "reports__report", {"month": "june"})
@@ -345,6 +426,8 @@ async def test_result_before_finished_is_an_error(connect) -> None:
         assert early.is_error is True
         assert early.meta is not None
         assert early.meta["warpweft.error"] == "not_ready"
+        # Still running -> the result will appear, so the poll is retryable.
+        assert early.meta["warpweft.retryable"] is True
         release.set()
         await poll_client(client, task_id, "completed")
 
@@ -385,7 +468,18 @@ async def test_cancel_stops_a_running_task(connect) -> None:
         assert ack.is_error is False
         with anyio.fail_after(2):
             await cancelled.wait()
-        await poll_client(client, task_id, "cancelled")
+        settled = await poll_client(client, task_id, "cancelled")
+        # Terminal status carries a clear message, not stale in-flight progress.
+        assert settled.structured_content is not None
+        assert settled.structured_content["message"] == "cancelled"
+
+        # task_result on a terminal-but-result-less task is a distinct,
+        # non-retryable terminal error, never the retry-implying not_ready.
+        after = await client.call_tool("task_result", {"task_id": task_id})
+        assert after.is_error is True
+        assert after.meta is not None
+        assert after.meta["warpweft.error"] == "cancelled"
+        assert after.meta["warpweft.retryable"] is False
 
 
 async def test_unknown_task_is_a_tool_error(connect) -> None:

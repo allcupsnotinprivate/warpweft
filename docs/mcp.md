@@ -102,7 +102,7 @@ machine-readable guidance:
 
 | meta key | Meaning |
 | --- | --- |
-| `warpweft.error` | a stable code: `invalid_arguments`, `circuit_open`, `timeout`, `retry_exhausted`, `unavailable`, `transient`, `permanent`, `error` - plus `declined` / `confirmation_unsupported` from the [destructive-tool gate](#confirming-destructive-tools) |
+| `warpweft.error` | a stable code: `invalid_arguments`, `circuit_open`, `timeout`, `retry_exhausted`, `unavailable`, `transient`, `permanent`, `error` - plus `declined` / `confirmation_unsupported` from the [destructive-tool gate](#confirming-destructive-tools), and `unknown_task` / `not_ready` / `cancelled` / `failed` from the [background task tools](#background-long-running-tools) (`not_ready` is the only retryable one) |
 | `warpweft.retryable` | whether calling again can help |
 | `warpweft.retry_after_s` | for `circuit_open`: seconds until the breaker admits a probe |
 | `warpweft.attempts` | for `retry_exhausted`: attempts already spent |

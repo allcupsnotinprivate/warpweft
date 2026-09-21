@@ -135,6 +135,12 @@ class InMemoryTaskStore:
             record = self._records.get(task_id)
             if record is None:
                 return
+            if self._expired(record):
+                # Do not resurrect a record past its TTL - dropping on access is
+                # the store's contract, and a late progress update must not
+                # silently extend a task's lifetime.
+                del self._records[task_id]
+                return
             self._records[task_id] = replace(
                 record,
                 status=status,
@@ -198,7 +204,10 @@ class TaskRunner:
         """Mint an id, durably create the task, then spawn it.
 
         The record is persisted before we return so a poll that races the
-        spawn always finds the task.
+        spawn always finds the task. The cancel scope is registered *here*,
+        synchronously before ``start_soon``, so a ``cancel`` that arrives before
+        the background job has actually started running is still honoured (there
+        is no window where the scope is missing).
         """
         now = self._clock.now()
         record = TaskRecord(
@@ -211,29 +220,37 @@ class TaskRunner:
             poll_interval_ms=DEFAULT_POLL_INTERVAL_MS,
         )
         await self._store.create(record)
-        self._tg.start_soon(self._run, record.task_id, job)
+        scope = anyio.CancelScope()
+        self._scopes[record.task_id] = scope
+        self._tg.start_soon(self._run, record.task_id, job, scope)
         return record
 
     async def cancel(self, task_id: str) -> None:
-        """Request cancellation of a running task; a no-op if it already ended."""
+        """Request cancellation of a running task; a no-op if it already ended.
+
+        The scope is registered by `start` before it returns, so any cancel for
+        a live task finds it - even one issued before the job began executing.
+        """
         scope = self._scopes.get(task_id)
         if scope is not None:
             scope.cancel()
 
-    async def _run(self, task_id: str, job: TaskJob) -> None:
-        scope = anyio.CancelScope()
-        self._scopes[task_id] = scope
+    async def _run(self, task_id: str, job: TaskJob, scope: anyio.CancelScope) -> None:
         try:
+            result: mt.CallToolResult | None = None
             with scope:
                 result = await job(task_id)
-                status: TaskStatus = "failed" if result.is_error else "completed"
-                await self._store.update(task_id, status=status, result=result)
-                return
-            # Falls through here only when the scope caught its own
-            # cancellation (a task_cancel). Shield the bookkeeping so the
-            # cancellation cannot also interrupt the status write.
+            # The terminal write is shielded so a cancel that races job
+            # completion can neither interrupt the write nor discard a result
+            # the job already produced. ``result is None`` means the job's own
+            # await was cancelled mid-flight (the scope swallowed it).
             with anyio.CancelScope(shield=True):
-                await self._store.update(task_id, status="cancelled")
+                if result is None:
+                    # Overwrite any stale in-flight progress message.
+                    await self._store.update(task_id, status="cancelled", status_message="cancelled")
+                else:
+                    status: TaskStatus = "failed" if result.is_error else "completed"
+                    await self._store.update(task_id, status=status, result=result)
         except Exception as exc:
             # ``job`` is expected to turn every failure into an error result, so
             # this is a last-resort guard: a bug here must not tear down the

@@ -31,7 +31,7 @@ from warpweft.runtime import App
 
 from .errors import error_result
 from .schema import tool_input_schema
-from .tasks import DEFAULT_TTL_MS, TaskRunner, TaskStatusView, status_view, task_runner
+from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRunner, TaskStatusView, status_view, task_runner
 from .tool import ToolMeta, is_tool, tool_meta
 
 #: Names of the shared built-in tools that drive background execution. They are
@@ -219,31 +219,66 @@ def _describe_tool(cls: type, binding: ToolBinding) -> mt.Tool:
     )
 
 
+def _rewrite_refs(node: Any, remap: dict[str, str]) -> Any:
+    """Return ``node`` with every ``$ref`` string rewritten per ``remap``."""
+    if isinstance(node, dict):
+        return {
+            key: (remap.get(value, value) if key == "$ref" and isinstance(value, str) else _rewrite_refs(value, remap))
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [_rewrite_refs(item, remap) for item in node]
+    return node
+
+
+def _namespaced_defs(binding: ToolBinding) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A background op's result schema and ``$defs``, namespaced by the tool name.
+
+    ``$ref`` pointers are root-relative (``#/$defs/Foo``), so hoisting several
+    ops' ``$defs`` into one root would let two different models that share a
+    name overwrite each other. Prefixing each op's defs with its (unique) tool
+    name and rewriting that op's refs to match keeps the union collision-free.
+    """
+    schema = dict(binding.spec.output_json_schema())
+    member_defs = schema.pop("$defs", None)
+    if not member_defs:
+        return schema, {}
+    prefix = f"{binding.name}."
+    remap = {f"#/$defs/{key}": f"#/$defs/{prefix}{key}" for key in member_defs}
+    member = _rewrite_refs(schema, remap)
+    renamed = {f"{prefix}{key}": _rewrite_refs(value, remap) for key, value in member_defs.items()}
+    return member, renamed
+
+
 def _task_result_output_schema(bindings: list[ToolBinding]) -> dict[str, Any]:
     """The ``task_result`` output schema: a union of every background op's result.
 
     Each background result is stored wrapped as ``{"result": <value>}`` (see
     `_background_result`), so the advertised schema is that wrapper with the
     inner value constrained to the ``oneOf`` of the ops' raw output schemas.
-    ``$defs`` from every member are hoisted to the wrapper root so nested
-    ``$ref`` pointers stay valid.
     """
     members: list[dict[str, Any]] = []
-    defs: dict[str, Any] = {}
-    for binding in bindings:
-        schema = dict(binding.spec.output_json_schema())
-        member_defs = schema.pop("$defs", None)
-        if member_defs:
-            defs.update(member_defs)
-        members.append(schema)
+    all_defs: dict[str, Any] = {}
+    if len(bindings) == 1:
+        # A single op cannot collide with itself, so keep its defs unprefixed.
+        only = dict(bindings[0].spec.output_json_schema())
+        defs = only.pop("$defs", None)
+        members.append(only)
+        if defs:
+            all_defs = defs
+    else:
+        for binding in bindings:
+            member, renamed = _namespaced_defs(binding)
+            members.append(member)
+            all_defs.update(renamed)  # keys prefixed by the unique tool name
     result_schema = members[0] if len(members) == 1 else {"oneOf": members}
     wrapper: dict[str, Any] = {
         "type": "object",
         "properties": {"result": result_schema},
         "required": ["result"],
     }
-    if defs:
-        wrapper["$defs"] = defs
+    if all_defs:
+        wrapper["$defs"] = all_defs
     return wrapper
 
 
@@ -315,8 +350,8 @@ def _status_result(view: TaskStatusView) -> mt.CallToolResult:
 _ELICITATION = mt.ClientCapabilities(elicitation=mt.ElicitationCapability())
 
 
-def _refusal(text: str, *, code: str) -> mt.CallToolResult:
-    meta = {"warpweft.error": code, "warpweft.retryable": False}
+def _refusal(text: str, *, code: str, retryable: bool = False) -> mt.CallToolResult:
+    meta = {"warpweft.error": code, "warpweft.retryable": retryable}
     return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)], is_error=True, meta=meta)
 
 
@@ -491,9 +526,15 @@ async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolReques
         return _status_result(status_view(fresh or record))
 
     # _TASK_RESULT: the stored payload is already typed and secret-masked.
-    if record.result is None:
-        return _refusal(f"task '{task_id}' is not finished (status: {record.status})", code="not_ready")
-    return record.result
+    if record.result is not None:
+        return record.result
+    if record.status in TERMINAL:
+        # Terminal but no payload (cancelled, or a job that failed before
+        # producing a result): a distinct, non-retryable code - never the
+        # retry-implying not_ready, which would make a poller loop forever.
+        return _refusal(f"task '{task_id}' ended without a result (status: {record.status})", code=record.status)
+    # Still running: the result will appear, so invite the caller to poll again.
+    return _refusal(f"task '{task_id}' is not finished yet (status: {record.status})", code="not_ready", retryable=True)
 
 
 async def run_stdio(
