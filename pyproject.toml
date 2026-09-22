@@ -136,6 +136,7 @@ markers = [
     "unit: isolated unit tests",
     "integration: integration tests against real dependencies",
     "e2e: end-to-end tests against a running service",
+    "characterization: pins current (possibly buggy) behavior; fails loudly when the product is fixed",
 ]
 filterwarnings = []
 

@@ -7,16 +7,15 @@ policy links. In-memory OTel providers per test; globals untouched.
 
 from typing import Any
 
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Metric
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from _support.axes import context_axes
+from _support.containers import registry_of
+from _support.otel import axis_attrs_of, by_name, metering, points_by_operation, read, tracing
+import anyio
 from opentelemetry.trace import StatusCode
 import pytest
 
-from warpweft.core.axes import GLOBAL_SCOPE
-from warpweft.core.component import AComponent, EmptySettings, invocable
+from warpweft.core.axes import GLOBAL_SCOPE, ScopeSpec
+from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Container, Registry
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import PermanentError, TransientError
@@ -74,46 +73,7 @@ class UpperBad(AComponent[EmptySettings, None, str]):
 
 
 def fresh_registry() -> Registry:
-    reg = Registry()
-    for cls in (Dep, BadDep, Upper, UpperBad):
-        reg.register(cls)
-    return reg
-
-
-# --- helpers -----------------------------------------------------------------
-
-
-def tracing() -> tuple[TracerProvider, InMemorySpanExporter]:
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    return provider, exporter
-
-
-def metering() -> tuple[MeterProvider, InMemoryMetricReader]:
-    reader = InMemoryMetricReader()
-    return MeterProvider(metric_readers=[reader]), reader
-
-
-def read(reader: InMemoryMetricReader) -> dict[str, Metric]:
-    flat: dict[str, Metric] = {}
-    data = reader.get_metrics_data()
-    for resource_metrics in data.resource_metrics if data else ():
-        for scope_metrics in resource_metrics.scope_metrics:
-            for metric in scope_metrics.metrics:
-                flat[metric.name] = metric
-    return flat
-
-
-def points_by_operation(metric: Metric) -> dict[tuple[str, str], Any]:
-    """Data points keyed by ``(operation, status)``."""
-    return {
-        (p.attributes[conv.ATTR_OPERATION], p.attributes.get(conv.ATTR_STATUS, "")): p for p in metric.data.data_points
-    }
-
-
-def by_name(spans: tuple[ReadableSpan, ...], name: str) -> list[ReadableSpan]:
-    return [s for s in spans if s.name == name]
+    return registry_of(Dep, BadDep, Upper, UpperBad)
 
 
 # --- spans and metrics -------------------------------------------------------
@@ -349,3 +309,193 @@ async def test_guarded_invocation_of_the_dependency_is_not_doubled() -> None:
     await container.stop()
 
     assert len(by_name(exporter.get_finished_spans(), "dep.fetch")) == 1
+
+
+# --- dependency-call scope attribution ---------------------------------------
+
+
+async def test_dependency_span_carries_the_deps_slice_not_the_callers() -> None:
+    tracer_provider, exporter = tracing()
+    axes, handles = context_axes("tenant", "region")
+
+    class RegionDep(AComponent[EmptySettings, None, str]):
+        name = "region-dep"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("region",))
+
+        @invocable
+        async def where(self) -> str:
+            return "x"
+
+    class TenantCaller(AComponent[EmptySettings, None, str]):
+        name = "tenant-caller"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+        dependencies = ("region-dep",)
+
+        @invocable
+        async def ask(self) -> str:
+            return await self.dependency("region-dep").where()
+
+    container = Container.build(
+        registry_of(RegionDep, TenantCaller),
+        {"region-dep": {}, "tenant-caller": {}},
+        axes=axes,
+        tracer_provider=tracer_provider,
+    )
+    await container.start()
+    with handles["tenant"].use("acme"), handles["region"].use("eu"):
+        await container.invoke("tenant-caller", "ask")
+    await container.stop()
+
+    (parent,) = by_name(exporter.get_finished_spans(), "tenant-caller.ask")
+    (child,) = by_name(exporter.get_finished_spans(), "region-dep.where")
+    assert axis_attrs_of(parent) == {"tenant": "acme"}  # caller's own slice
+    assert axis_attrs_of(child) == {"region": "eu"}  # the dependency's own slice, not the caller's
+
+
+async def test_process_dep_span_carries_component_scope_key() -> None:
+    tracer_provider, exporter = tracing()
+    container = Container.build(fresh_registry(), {"dep": {}, "upper": {}}, tracer_provider=tracer_provider)
+    await container.start()
+    await container.invoke("upper", "run", tag="x")
+    await container.stop()
+
+    (dep_span,) = by_name(exporter.get_finished_spans(), "dep.fetch")
+    assert axis_attrs_of(dep_span) == {"component": "dep"}  # process dep is sliced by its component key
+
+
+# --- dependency-call argument shape, deadline and correlation ----------------
+
+
+async def test_positional_dependency_call_captures_named_arguments() -> None:
+    seen: dict[str, dict[str, Any]] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = dict(ctx.arguments or {})
+
+    class Dep(AComponent[EmptySettings, None, str]):
+        name = "dep"
+
+        @invocable
+        async def fetch(self, x: int, y: int = 5) -> str:
+            return f"{x},{y}"
+
+    class Up(AComponent[EmptySettings, None, str]):
+        name = "up"
+        dependencies = ("dep",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("dep").fetch(1)  # positional
+
+    container = Container.build(registry_of(Dep, Up), {"dep": {}, "up": {}}, span_enricher=enrich)
+    await container.start()
+    await container.invoke("up", "run")
+    await container.stop()
+    assert seen["dep.fetch"] == {"x": 1}  # positional mapped to the parameter name via signature.bind
+
+
+@pytest.mark.characterization
+async def test_bad_arity_falls_back_to_kwargs_and_raises_the_real_error() -> None:
+    # CHARACTERIZATION: a wrong-arity dependency call cannot be bound, so the proxy
+    # records kwargs only (positionals dropped) and lets the method's own TypeError
+    # propagate.
+    seen: dict[str, dict[str, Any]] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = dict(ctx.arguments or {})
+
+    class Dep(AComponent[EmptySettings, None, str]):
+        name = "dep"
+
+        @invocable
+        async def fetch(self, x: int) -> str:
+            return str(x)
+
+    class Up(AComponent[EmptySettings, None, str]):
+        name = "up"
+        dependencies = ("dep",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("dep").fetch(1, 2, 3)  # too many positionals
+
+    container = Container.build(registry_of(Dep, Up), {"dep": {}, "up": {}}, span_enricher=enrich)
+    await container.start()
+    with pytest.raises(TypeError):
+        await container.invoke("up", "run")
+    await container.stop()
+    assert seen["dep.fetch"] == {}  # signature.bind failed -> kwargs-only (empty), positionals dropped
+
+
+@pytest.mark.characterization
+async def test_expired_deadline_is_inherited_but_not_enforced() -> None:
+    # CHARACTERIZATION: a dependency call inherits the caller's deadline into its
+    # ctx, but the raw (link-less) dependency path enforces nothing - the call runs
+    # to completion even when the budget is already spent.
+    seen: dict[str, float | None] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = ctx.deadline
+
+    class Slow(AComponent[EmptySettings, None, str]):
+        name = "slow"
+
+        @invocable
+        async def go(self) -> str:
+            await anyio.sleep(0.05)  # outlives the tiny budget below
+            return "done"
+
+    class Caller(AComponent[EmptySettings, None, str]):
+        name = "caller"
+        dependencies = ("slow",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("slow").go()
+
+    container = Container.build(registry_of(Slow, Caller), {"slow": {}, "caller": {}}, span_enricher=enrich)
+    await container.start()
+    outcome = await container.invoke("caller", "run", budget=0.001)
+    await container.stop()
+    assert seen["slow.go"] is not None  # deadline inherited
+    assert outcome.value == "done"  # yet the dependency call was not cut off
+
+
+async def test_correlation_id_propagates_invoke_to_nested_deps() -> None:
+    tracer_provider, exporter = tracing()
+
+    class Leaf(AComponent[EmptySettings, None, str]):
+        name = "leaf"
+
+        @invocable
+        async def tip(self) -> str:
+            return "leaf"
+
+    class Mid(AComponent[EmptySettings, None, str]):
+        name = "mid"
+        dependencies = ("leaf",)
+
+        @invocable
+        async def hop(self) -> str:
+            return await self.dependency("leaf").tip()
+
+    class Root(AComponent[EmptySettings, None, str]):
+        name = "root"
+        dependencies = ("mid",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("mid").hop()
+
+    container = Container.build(
+        registry_of(Leaf, Mid, Root), {"leaf": {}, "mid": {}, "root": {}}, tracer_provider=tracer_provider
+    )
+    await container.start()
+    await container.invoke("root", "run", correlation_id="corr-9")
+    await container.stop()
+
+    spans = exporter.get_finished_spans()
+    ids = {s.name: dict(s.attributes or {})[conv.ATTR_CORRELATION_ID] for s in spans}
+    assert ids["root.run"] == ids["mid.hop"] == ids["leaf.tip"] == "corr-9"  # one id through the whole tree
