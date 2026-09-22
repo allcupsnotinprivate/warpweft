@@ -32,6 +32,7 @@ __all__ = [
     "ATTR_BREAKER_STATE_FROM",
     "ATTR_BREAKER_STATE_TO",
     "ATTR_CACHE",
+    "ATTR_COMPONENT",
     "ATTR_CORRELATION_ID",
     "ATTR_DEGRADED",
     "ATTR_ERROR_CLASS",
@@ -44,6 +45,7 @@ __all__ = [
     "EVENT_RETRY_BACKOFF",
     "FACT_CACHE",
     "FACT_DEGRADED",
+    "INSTRUMENTATION_COMPONENT_NAME",
     "INSTRUMENTATION_NAME",
     "METRIC_BREAKER_REJECTIONS",
     "METRIC_BREAKER_TRANSITIONS",
@@ -61,6 +63,8 @@ __all__ = [
 
 #: Tracer and meter instrumentation name.
 INSTRUMENTATION_NAME: Final = "warpweft"
+#: Meter instrumentation name for component-defined metrics (``self.telemetry``).
+INSTRUMENTATION_COMPONENT_NAME: Final = "warpweft.component"
 
 # --- span / metric attribute keys -------------------------------------------
 ATTR_OPERATION: Final = "warpweft.operation"
@@ -71,6 +75,8 @@ ATTR_ATTEMPTS: Final = "warpweft.attempts"
 ATTR_STATUS: Final = "warpweft.status"
 ATTR_ERROR_CLASS: Final = "warpweft.error.class"
 ATTR_CACHE: Final = "warpweft.cache"
+#: Component name on component-defined metric points (``self.telemetry``).
+ATTR_COMPONENT: Final = "warpweft.component"
 #: Axis attributes are ``warpweft.axis.<axis name>`` = axis value.
 AXIS_ATTR_PREFIX: Final = "warpweft.axis."
 

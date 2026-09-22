@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from warpweft.core.axes import EMPTY_SCOPE, ScopeSpec
 from warpweft.core.context import InvocationContext
 from warpweft.core.outcome import Outcome
+from warpweft.core.telemetry.component import NOOP_TELEMETRY, ComponentTelemetry
 from warpweft.core.unit import Identity
 
 from .health import HealthStatus
@@ -104,9 +105,24 @@ class AComponent(Generic[TSettings, TIn, TOut]):
     #: outside and may therefore declare no invocables.
     entrypoint: ClassVar[bool] = True
 
+    #: Bound by the container at instantiation; ``None`` outside a container.
+    _ww_telemetry: ComponentTelemetry | None = None
+
     def __init__(self, settings: TSettings) -> None:
         self.settings: TSettings = settings
         self._deps: Mapping[str, AComponent[Any, Any, Any]] = {}
+
+    @property
+    def telemetry(self) -> ComponentTelemetry:
+        """Channel for the component's own metrics (see `ComponentTelemetry`).
+
+        Inside a container this records through the container's meter provider
+        with ``warpweft.component`` and the instance's axis pairs attached
+        automatically. A component constructed directly (unit tests) gets a
+        no-op that accepts every call and records nothing.
+        """
+        bound = self._ww_telemetry
+        return bound if bound is not None else NOOP_TELEMETRY
 
     def bind_dependencies(self, deps: Mapping[str, "AComponent[Any, Any, Any]"]) -> None:
         """Install resolved dependencies (called by the container before start).

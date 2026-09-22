@@ -41,6 +41,8 @@ from warpweft.core.pipeline.builtin.concurrency import ConcurrencyInterceptor
 from warpweft.core.pipeline.chain import build_chain, compose
 from warpweft.core.pipeline.interceptor import Next
 from warpweft.core.pipeline.state import InMemoryStateStore
+from warpweft.core.telemetry.component import ComponentTelemetry, component_meter
+from warpweft.core.telemetry.dependency import DependencyTelemetryProxy
 from warpweft.core.telemetry.instrument import DEFAULT_CONFIG, TelemetryConfig, instrument
 
 from .config import (
@@ -152,6 +154,7 @@ class Container:
         self._init_timeout = init_timeout
         self._drain_timeout = drain_timeout
         self._health_timeout = health_timeout
+        self._component_meter = component_meter(meter_provider)
         self._link_store = InMemoryStateStore(max_entries=scoped_max_entries)
         self._scoped_stores: dict[str, InMemoryStateStore] = {}
         self._scoped_max_entries = scoped_max_entries
@@ -280,7 +283,13 @@ class Container:
     async def _start_process(self, name: str) -> None:
         reg = self._registrations[name]
         instance, _ = self._instantiate(name, GLOBAL_SCOPE)
-        instance.bind_dependencies({d: self._process[d] for d in reg.descriptor.dependencies if d in self._process})
+        instance.bind_dependencies(
+            {
+                d: self._dependency_proxy(d, self._process[d], (("component", d),))
+                for d in reg.descriptor.dependencies
+                if d in self._process
+            }
+        )
         instance.bind_invoker(self._invoker_for(name))
         try:
             with anyio.fail_after(self._init_timeout):
@@ -390,11 +399,38 @@ class Container:
             reg = self._registrations[name]
             if reg.descriptor.lifetime is Lifetime.PROCESS:
                 if name in self._process:
-                    resolved[name] = self._process[name]
+                    resolved[name] = self._dependency_proxy(name, self._process[name], (("component", name),))
             else:
-                instance, _ = await self._scoped_instance(name)
-                resolved[name] = instance
+                instance, dep_scope = await self._scoped_instance(name)
+                resolved[name] = self._dependency_proxy(name, instance, dep_scope)
         return resolved
+
+    def _dependency_proxy(
+        self, name: str, instance: AComponent[Any, Any, Any], scope_key: ScopeKey
+    ) -> AComponent[Any, Any, Any]:
+        """Wrap a dependency in its telemetry proxy before injection.
+
+        The proxy adds spans and metrics to the dependency's invocable calls
+        while running **no policy links** - a raw dependency call stays raw,
+        it only becomes observable. Chains built by `_build_chain` keep
+        wrapping the bare instance, so guarded invocations never double up.
+        """
+        reg = self._registrations[name]
+        return cast(
+            "AComponent[Any, Any, Any]",
+            DependencyTelemetryProxy(
+                instance,
+                component=name,
+                methods=frozenset(reg.descriptor.invocables),
+                scope_key=scope_key,
+                clock=self._clock,
+                tracer_provider=self._tracer_provider,
+                meter_provider=self._meter_provider,
+                classifier=self._classifier,
+                config=self._telemetry,
+                span_enricher=self._span_enricher,
+            ),
+        )
 
     # --- wiring --------------------------------------------------------------
 
@@ -430,9 +466,16 @@ class Container:
         config = self._assemble(name, scope_key)
         own = reg.descriptor.settings_model
         if own is None:
-            return reg.cls(config), config
-        settings = own.model_validate(config.model_dump(exclude={POLICY_FIELD}))
-        return reg.cls(settings), config
+            instance = reg.cls(config)
+        else:
+            settings = own.model_validate(config.model_dump(exclude={POLICY_FIELD}))
+            instance = reg.cls(settings)
+        # Domain-metrics channel: each instance gets its own, carrying the
+        # component name and the slice's axis pairs (allowlist-filtered).
+        instance._ww_telemetry = ComponentTelemetry(
+            name, scope_key, self._component_meter, self._telemetry.axis_allowlist
+        )
+        return instance, config
 
     def _build_chain(self, instance: AComponent[Any, Any, Any], name: str, method: str, config: BaseModel) -> Next:
         spec = self._registrations[name].descriptor.invocables[method]
