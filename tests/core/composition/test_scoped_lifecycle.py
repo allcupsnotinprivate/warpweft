@@ -14,7 +14,8 @@ from _support.components import failing_start, hanging_start, scoped_recorder
 import anyio
 import pytest
 
-from warpweft.core.component import Criticality
+from warpweft.core.axes import ScopeSpec
+from warpweft.core.component import AComponent, Criticality, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Container
 from warpweft.core.errors import ConfigurationError
 
@@ -98,3 +99,47 @@ async def test_invoke_after_stop_reports_not_started(container: Make) -> None:
         pass  # container is stopped on exit
     with handles["tenant"].use("acme"), pytest.raises(ConfigurationError, match="not started"):
         await c.invoke("rec", "whoami")
+
+
+@pytest.mark.characterization
+async def test_lru_eviction_stops_an_in_flight_instance(container: Make) -> None:
+    # CHARACTERIZATION: the scoped store's LRU stops an evicted instance even
+    # while a call is still running on it (the store lock does not cover the
+    # in-flight call). The parked call nonetheless completes.
+    axes, handles = context_axes("tenant")
+    stopped: list[str] = []
+    gate = anyio.Event()
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+
+        def __init__(self, settings: EmptySettings) -> None:
+            super().__init__(settings)
+            self._tenant = handles["tenant"].current()
+
+        async def stop(self) -> None:
+            stopped.append(self._tenant or "?")
+
+        @invocable
+        async def go(self) -> str:
+            if self._tenant == "acme":
+                await gate.wait()  # park acme mid-call
+            return self._tenant or "?"
+
+    result: dict[str, str] = {}
+
+    async def call(tenant: str) -> None:
+        with handles["tenant"].use(tenant):
+            result[tenant] = (await c.invoke("svc", "go")).value
+
+    async with container(Svc, config={"svc": {}}, axes=axes, scoped_max_entries=1) as c:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(call, "acme")
+            await anyio.sleep(0.02)  # acme now parked in go()
+            tg.start_soon(call, "globex")  # evicts acme (max_entries=1) and stops it
+            await anyio.sleep(0.02)
+            assert stopped == ["acme"]  # acme was stopped while still running
+            gate.set()
+        assert result["acme"] == "acme"  # the parked call completed anyway

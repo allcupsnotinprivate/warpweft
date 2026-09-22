@@ -110,3 +110,20 @@ async def test_degraded_optional_process_dep_raises_keyerror_at_use(container: M
         assert c.is_degraded("opt-proc") is True
         with handles["tenant"].use("acme"), pytest.raises(KeyError, match="opt-proc"):
             await c.invoke("caller", "use_dep")
+
+
+@pytest.mark.characterization
+async def test_dep_re_resolution_creates_unused_slices(container: Make) -> None:
+    # CHARACTERIZATION: _resolve_dependencies runs on every invoke of a scoped
+    # component, so invoking a cached caller under a new dep axis creates (and
+    # starts) a fresh dep slice the caller never uses.
+    axes, handles = context_axes("tenant", "region")
+    region_dep, caller = _region_dep_and_caller(handles["region"])
+    async with container(region_dep, caller, config={"region-dep": {}, "tenant-caller": {}}, axes=axes) as c:
+        with handles["tenant"].use("acme"), handles["region"].use("eu"):
+            await c.invoke("tenant-caller", "ask")  # creates the eu dep the caller keeps
+        with handles["tenant"].use("acme"), handles["region"].use("us"):
+            await c.invoke("tenant-caller", "ask")  # re-resolves deps -> creates a us dep slice
+        slices = set(c.snapshot().live_slices["region-dep"])
+        assert (("region", "eu"),) in slices  # the one the cached caller actually uses
+        assert (("region", "us"),) in slices  # created as a side effect, unused by acme

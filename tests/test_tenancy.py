@@ -17,9 +17,9 @@ import anyio
 import pytest
 
 from warpweft.core.axes import ScopeSpec
-from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
+from warpweft.core.component import AComponent, Criticality, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Container
-from warpweft.core.errors import CircuitOpen, TransientError
+from warpweft.core.errors import CircuitOpen, ConfigurationError, TransientError
 
 pytestmark = pytest.mark.anyio
 
@@ -164,3 +164,84 @@ async def test_concurrent_tenants_keep_state_isolated(container: Make) -> None:
             await anyio.sleep(0.05)  # both parked in go()
             gate.set()
         assert results == {"acme": "acme", "globex": "globex"}  # no cross-tenant leakage
+
+
+async def test_concurrency_limits_do_not_couple_tenants(container: Make) -> None:
+    axes, handles = context_axes("tenant")
+    gate = anyio.Event()
+    running: list[str] = []
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+
+        @invocable
+        async def go(self) -> str:
+            tenant = handles["tenant"].current() or "?"
+            running.append(tenant)
+            await gate.wait()
+            return tenant
+
+    # inner_limit=1 => one in-flight call per tenant slice; outer_limit is generous.
+    config = {"svc": {"policy": {"concurrency": {"inner_limit": 1, "outer_limit": 10}}}}
+    async with container(Svc, config=config, axes=axes) as c:
+
+        async def call(tenant: str) -> None:
+            with handles["tenant"].use(tenant):
+                await c.invoke("svc", "go")
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(call, "acme")  # enters, holds acme's inner slot
+            tg.start_soon(call, "acme")  # blocked by acme's inner_limit=1
+            await anyio.sleep(0.03)
+            tg.start_soon(call, "globex")  # acme's saturation must not block globex
+            await anyio.sleep(0.03)
+            # exactly one acme call is running, and globex got through.
+            assert running.count("acme") == 1
+            assert "globex" in running
+            gate.set()
+
+
+async def test_degradation_is_per_tenant_slice(container: Make) -> None:
+    axes, handles = context_axes("tenant")
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+        criticality = Criticality.OPTIONAL
+
+        def stub(self, ctx: object) -> str:
+            return "STUB"
+
+        @invocable
+        async def go(self) -> str:
+            if handles["tenant"].current() == "acme":
+                raise TransientError("acme down")
+            return "LIVE"
+
+    async with container(Svc, config={"svc": {"policy": {"degradation": {}}}}, axes=axes) as c:
+        with handles["tenant"].use("acme"):
+            acme = await c.invoke("svc", "go")
+            assert (acme.value, acme.source, acme.degraded) == ("STUB", "stub", True)
+        with handles["tenant"].use("globex"):
+            globex = await c.invoke("svc", "go")
+            assert (globex.value, globex.source, globex.degraded) == ("LIVE", "live", False)
+
+
+async def test_missing_required_axis_fails_scoped_invoke(container: Make) -> None:
+    axes, _ = context_axes("tenant")  # required (no default)
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+
+        @invocable
+        async def go(self) -> str:
+            return "ok"
+
+    async with container(Svc, config={"svc": {}}, axes=axes) as c:
+        with pytest.raises(ConfigurationError, match="tenant"):
+            await c.invoke("svc", "go")  # no tenant bound

@@ -10,6 +10,7 @@ from typing import Any
 from _support.axes import context_axes
 from _support.containers import registry_of
 from _support.otel import axis_attrs_of, by_name, metering, points_by_operation, read, tracing
+import anyio
 from opentelemetry.trace import StatusCode
 import pytest
 
@@ -362,3 +363,139 @@ async def test_process_dep_span_carries_component_scope_key() -> None:
 
     (dep_span,) = by_name(exporter.get_finished_spans(), "dep.fetch")
     assert axis_attrs_of(dep_span) == {"component": "dep"}  # process dep is sliced by its component key
+
+
+# --- dependency-call argument shape, deadline and correlation ----------------
+
+
+async def test_positional_dependency_call_captures_named_arguments() -> None:
+    seen: dict[str, dict[str, Any]] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = dict(ctx.arguments or {})
+
+    class Dep(AComponent[EmptySettings, None, str]):
+        name = "dep"
+
+        @invocable
+        async def fetch(self, x: int, y: int = 5) -> str:
+            return f"{x},{y}"
+
+    class Up(AComponent[EmptySettings, None, str]):
+        name = "up"
+        dependencies = ("dep",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("dep").fetch(1)  # positional
+
+    container = Container.build(registry_of(Dep, Up), {"dep": {}, "up": {}}, span_enricher=enrich)
+    await container.start()
+    await container.invoke("up", "run")
+    await container.stop()
+    assert seen["dep.fetch"] == {"x": 1}  # positional mapped to the parameter name via signature.bind
+
+
+@pytest.mark.characterization
+async def test_bad_arity_falls_back_to_kwargs_and_raises_the_real_error() -> None:
+    # CHARACTERIZATION: a wrong-arity dependency call cannot be bound, so the proxy
+    # records kwargs only (positionals dropped) and lets the method's own TypeError
+    # propagate.
+    seen: dict[str, dict[str, Any]] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = dict(ctx.arguments or {})
+
+    class Dep(AComponent[EmptySettings, None, str]):
+        name = "dep"
+
+        @invocable
+        async def fetch(self, x: int) -> str:
+            return str(x)
+
+    class Up(AComponent[EmptySettings, None, str]):
+        name = "up"
+        dependencies = ("dep",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("dep").fetch(1, 2, 3)  # too many positionals
+
+    container = Container.build(registry_of(Dep, Up), {"dep": {}, "up": {}}, span_enricher=enrich)
+    await container.start()
+    with pytest.raises(TypeError):
+        await container.invoke("up", "run")
+    await container.stop()
+    assert seen["dep.fetch"] == {}  # signature.bind failed -> kwargs-only (empty), positionals dropped
+
+
+@pytest.mark.characterization
+async def test_expired_deadline_is_inherited_but_not_enforced() -> None:
+    # CHARACTERIZATION: a dependency call inherits the caller's deadline into its
+    # ctx, but the raw (link-less) dependency path enforces nothing - the call runs
+    # to completion even when the budget is already spent.
+    seen: dict[str, float | None] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = ctx.deadline
+
+    class Slow(AComponent[EmptySettings, None, str]):
+        name = "slow"
+
+        @invocable
+        async def go(self) -> str:
+            await anyio.sleep(0.05)  # outlives the tiny budget below
+            return "done"
+
+    class Caller(AComponent[EmptySettings, None, str]):
+        name = "caller"
+        dependencies = ("slow",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("slow").go()
+
+    container = Container.build(registry_of(Slow, Caller), {"slow": {}, "caller": {}}, span_enricher=enrich)
+    await container.start()
+    outcome = await container.invoke("caller", "run", budget=0.001)
+    await container.stop()
+    assert seen["slow.go"] is not None  # deadline inherited
+    assert outcome.value == "done"  # yet the dependency call was not cut off
+
+
+async def test_correlation_id_propagates_invoke_to_nested_deps() -> None:
+    tracer_provider, exporter = tracing()
+
+    class Leaf(AComponent[EmptySettings, None, str]):
+        name = "leaf"
+
+        @invocable
+        async def tip(self) -> str:
+            return "leaf"
+
+    class Mid(AComponent[EmptySettings, None, str]):
+        name = "mid"
+        dependencies = ("leaf",)
+
+        @invocable
+        async def hop(self) -> str:
+            return await self.dependency("leaf").tip()
+
+    class Root(AComponent[EmptySettings, None, str]):
+        name = "root"
+        dependencies = ("mid",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("mid").hop()
+
+    container = Container.build(
+        registry_of(Leaf, Mid, Root), {"leaf": {}, "mid": {}, "root": {}}, tracer_provider=tracer_provider
+    )
+    await container.start()
+    await container.invoke("root", "run", correlation_id="corr-9")
+    await container.stop()
+
+    spans = exporter.get_finished_spans()
+    ids = {s.name: dict(s.attributes or {})[conv.ATTR_CORRELATION_ID] for s in spans}
+    assert ids["root.run"] == ids["mid.hop"] == ids["leaf.tip"] == "corr-9"  # one id through the whole tree

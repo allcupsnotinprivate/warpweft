@@ -114,3 +114,58 @@ async def test_background_job_inherits_the_bound_axis(connect) -> None:
 
         result = await client.call_tool("task_result", {"task_id": task_id})
     assert result.structured_content == {"result": "acme"}
+
+
+def _multi_axis_app() -> tuple[App, dict[str, AxisHandle]]:
+    """An app whose tool reports both the ``tenant`` and ``region`` axis values."""
+    holder: dict[str, AxisHandle] = {}
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+
+        @tool()
+        @invocable
+        async def whoami(self) -> str:
+            return f"tenant={holder['tenant'].current()};region={holder['region'].current()}"
+
+    reg = Registry()
+    reg.register(Svc)
+    app = App(registry=reg)
+    holder["tenant"] = app.axis("tenant", default="unset")
+    holder["region"] = app.axis("region", default="unset")
+    return app, holder
+
+
+async def test_multiple_axis_binders_bind_all_axes(connect) -> None:
+    app, holder = _multi_axis_app()
+    binders = {
+        holder["tenant"]: lambda ctx, params: "acme",
+        holder["region"]: lambda ctx, params: "eu",
+    }
+    async with connect(app, axis_binders=binders) as client:
+        result = await client.call_tool("svc__whoami", {})
+    assert result.structured_content == {"result": "tenant=acme;region=eu"}  # both axes bound for one call
+
+
+async def test_concurrent_background_jobs_keep_submit_time_tenants(connect) -> None:
+    # Two background submits carry different tenants (from each call's arguments);
+    # each detached job must resolve to its own submit-time tenant.
+    app, tenant = _tenant_app(background=True)
+    binders = {tenant: lambda ctx, params: (params.arguments or {}).get("as_tenant")}
+
+    async def wait_result(client: Any, task_id: str) -> Any:
+        with anyio.fail_after(2):
+            while True:
+                status = await client.call_tool("task_status", {"task_id": task_id})
+                if status.structured_content and status.structured_content["status"] == "completed":
+                    return await client.call_tool("task_result", {"task_id": task_id})
+                await anyio.sleep(0.01)
+
+    async with task_runner() as runner, connect(app, runner=runner, axis_binders=binders) as client:
+        acme = (await client.call_tool("svc__whoami", {"as_tenant": "acme"})).structured_content["task_id"]
+        globex = (await client.call_tool("svc__whoami", {"as_tenant": "globex"})).structured_content["task_id"]
+        acme_result = await wait_result(client, acme)
+        globex_result = await wait_result(client, globex)
+
+    assert acme_result.structured_content == {"result": "acme"}
+    assert globex_result.structured_content == {"result": "globex"}

@@ -1,5 +1,8 @@
 """System health: readiness aggregation and container liveness/readiness."""
 
+from _support.axes import context_axes
+from _support.components import health_reporter
+from _support.containers import registry_of
 import anyio
 import pytest
 
@@ -158,4 +161,23 @@ async def test_health_check_timeout_is_unhealthy() -> None:
     result = await container.readiness()
     assert not result.ready
     assert result.components["slow"].state is Health.UNHEALTHY
+    await container.stop()
+
+
+@pytest.mark.characterization
+async def test_readiness_ignores_an_unhealthy_live_scoped_instance() -> None:
+    # CHARACTERIZATION: a scoped component always reports HealthStatus.ok() in
+    # readiness ("created on demand; nothing running to poll") - even when a live
+    # slice's health() would return unhealthy, and that health() is never called.
+    axes, handles = context_axes("tenant")
+    polls: list[int] = []
+    reporter = health_reporter("rep", healthy=lambda: False, on_check=lambda: polls.append(1))
+    container = Container.build(registry_of(reporter), {"rep": {}}, axes=axes)
+    await container.start()
+    with handles["tenant"].use("acme"):
+        await container.invoke("rep", "go")  # a live, unhealthy scoped slice now exists
+
+    result = await container.readiness()
+    assert result.ready  # readiness does not see the unhealthy scoped slice
+    assert polls == []  # the scoped instance's health() is never polled
     await container.stop()
