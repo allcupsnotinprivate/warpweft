@@ -8,9 +8,7 @@ asyncio and trio).
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from _support.otel import by_name, tracing
 from opentelemetry.trace import StatusCode
 import pytest
 
@@ -46,21 +44,10 @@ class RecordingClock:
         self._time += max(seconds, 0.0)
 
 
-def tracing() -> tuple[TracerProvider, InMemorySpanExporter]:
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    return provider, exporter
-
-
 def ctx(**overrides: Any) -> InvocationContext:
     defaults: dict[str, Any] = {"operation": "op", "correlation_id": "cid"}
     defaults.update(overrides)
     return InvocationContext(**defaults)
-
-
-def by_name(spans: tuple[ReadableSpan, ...], name: str) -> list[ReadableSpan]:
-    return [s for s in spans if s.name == name]
 
 
 async def ok(c: InvocationContext) -> Outcome[Any]:

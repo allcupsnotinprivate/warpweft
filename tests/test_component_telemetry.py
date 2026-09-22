@@ -8,8 +8,7 @@ attached; outside, the property degrades to a process-wide no-op.
 from contextvars import ContextVar
 from typing import Any
 
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Metric
+from _support.otel import metering, scoped_metrics, sole_point
 import pytest
 
 from warpweft.core.axes import Axis, AxisRegistry, ScopeSpec
@@ -81,29 +80,6 @@ def _registry_of(*classes: type[AComponent[Any, Any, Any]]) -> Registry:
     for cls in classes:
         registry.register(cls)
     return registry
-
-
-def metering() -> tuple[MeterProvider, InMemoryMetricReader]:
-    reader = InMemoryMetricReader()
-    return MeterProvider(metric_readers=[reader]), reader
-
-
-def scoped_metrics(reader: InMemoryMetricReader, scope_name: str) -> dict[str, Metric]:
-    """Metrics recorded under one instrumentation scope, by name."""
-    flat: dict[str, Metric] = {}
-    data = reader.get_metrics_data()
-    for resource_metrics in data.resource_metrics if data else ():
-        for scope_metrics in resource_metrics.scope_metrics:
-            if scope_metrics.scope.name != scope_name:
-                continue
-            for metric in scope_metrics.metrics:
-                flat[metric.name] = metric
-    return flat
-
-
-def sole_point(metric: Metric) -> Any:
-    (point,) = metric.data.data_points
-    return point
 
 
 # --- inside a container ------------------------------------------------------

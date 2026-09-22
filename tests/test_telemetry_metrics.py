@@ -6,8 +6,7 @@ values are absolutes); the OTel globals are never touched.
 
 from typing import Any
 
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Metric
+from _support.otel import metering, read, sole_point
 import pytest
 
 from warpweft.core.clock import ManualClock
@@ -23,27 +22,6 @@ from warpweft.core.telemetry.instrument import TelemetryConfig, instrument
 pytestmark = [pytest.mark.unit, pytest.mark.anyio]
 
 TWO_AXES = (("region", "eu"), ("tenant", "acme"))
-
-
-def metering() -> tuple[MeterProvider, InMemoryMetricReader]:
-    reader = InMemoryMetricReader()
-    return MeterProvider(metric_readers=[reader]), reader
-
-
-def read(reader: InMemoryMetricReader) -> dict[str, Metric]:
-    """Flatten collected metrics by name; absent name = nothing recorded."""
-    flat: dict[str, Metric] = {}
-    data = reader.get_metrics_data()
-    for resource_metrics in data.resource_metrics if data else ():
-        for scope_metrics in resource_metrics.scope_metrics:
-            for metric in scope_metrics.metrics:
-                flat[metric.name] = metric
-    return flat
-
-
-def sole_point(metric: Metric) -> Any:
-    (point,) = metric.data.data_points
-    return point
 
 
 def ctx(**overrides: Any) -> InvocationContext:

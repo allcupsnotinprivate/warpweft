@@ -7,11 +7,7 @@ policy links. In-memory OTel providers per test; globals untouched.
 
 from typing import Any
 
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Metric
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from _support.otel import by_name, metering, points_by_operation, read, tracing
 from opentelemetry.trace import StatusCode
 import pytest
 
@@ -78,42 +74,6 @@ def fresh_registry() -> Registry:
     for cls in (Dep, BadDep, Upper, UpperBad):
         reg.register(cls)
     return reg
-
-
-# --- helpers -----------------------------------------------------------------
-
-
-def tracing() -> tuple[TracerProvider, InMemorySpanExporter]:
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    return provider, exporter
-
-
-def metering() -> tuple[MeterProvider, InMemoryMetricReader]:
-    reader = InMemoryMetricReader()
-    return MeterProvider(metric_readers=[reader]), reader
-
-
-def read(reader: InMemoryMetricReader) -> dict[str, Metric]:
-    flat: dict[str, Metric] = {}
-    data = reader.get_metrics_data()
-    for resource_metrics in data.resource_metrics if data else ():
-        for scope_metrics in resource_metrics.scope_metrics:
-            for metric in scope_metrics.metrics:
-                flat[metric.name] = metric
-    return flat
-
-
-def points_by_operation(metric: Metric) -> dict[tuple[str, str], Any]:
-    """Data points keyed by ``(operation, status)``."""
-    return {
-        (p.attributes[conv.ATTR_OPERATION], p.attributes.get(conv.ATTR_STATUS, "")): p for p in metric.data.data_points
-    }
-
-
-def by_name(spans: tuple[ReadableSpan, ...], name: str) -> list[ReadableSpan]:
-    return [s for s in spans if s.name == name]
 
 
 # --- spans and metrics -------------------------------------------------------
