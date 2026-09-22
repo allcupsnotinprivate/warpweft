@@ -200,3 +200,88 @@ async def test_observer_is_restored_on_error_too() -> None:
     with pytest.raises(TransientError):
         await instrument(bad, tracer_provider=provider)(c)
     assert OBSERVER_KEY not in c.bag
+
+
+async def test_span_enricher_runs_on_success_with_outcome() -> None:
+    provider, exporter = tracing()
+    seen: list[tuple[InvocationContext, Outcome[Any] | None, BaseException | None]] = []
+
+    def enrich(span: Any, c: InvocationContext, outcome: Outcome[Any] | None, exc: BaseException | None) -> None:
+        seen.append((c, outcome, exc))
+        span.set_attribute("app.input", dict(c.arguments or {})["q"])
+        assert outcome is not None
+        span.set_attribute("app.output", outcome.value)
+
+    wrapped = instrument(ok, tracer_provider=provider, span_enricher=enrich)
+    await wrapped(ctx(arguments={"q": "hello"}))
+
+    (c, outcome, exc) = seen[0]
+    assert dict(c.arguments or {}) == {"q": "hello"}
+    assert outcome is not None and outcome.value == "ok"
+    assert exc is None
+
+    (span,) = exporter.get_finished_spans()
+    attrs = dict(span.attributes or {})
+    assert attrs["app.input"] == "hello"
+    assert attrs["app.output"] == "ok"
+
+
+async def test_span_enricher_runs_on_error_with_exception() -> None:
+    provider, exporter = tracing()
+    seen: list[tuple[Outcome[Any] | None, BaseException | None]] = []
+    boom = PermanentError("bad request")
+
+    async def bad(c: InvocationContext) -> Outcome[Any]:
+        raise boom
+
+    def enrich(span: Any, c: InvocationContext, outcome: Outcome[Any] | None, exc: BaseException | None) -> None:
+        seen.append((outcome, exc))
+        span.set_attribute("app.failed", True)
+
+    wrapped = instrument(bad, tracer_provider=provider, span_enricher=enrich)
+    with pytest.raises(PermanentError):
+        await wrapped(ctx())
+
+    (outcome, exc) = seen[0]
+    assert outcome is None
+    assert exc is boom
+
+    (span,) = exporter.get_finished_spans()
+    assert dict(span.attributes or {})["app.failed"] is True
+
+
+async def test_span_enricher_failure_does_not_break_success() -> None:
+    provider, _ = tracing()
+
+    def enrich(span: Any, c: InvocationContext, outcome: Outcome[Any] | None, exc: BaseException | None) -> None:
+        raise RuntimeError("enricher boom")
+
+    wrapped = instrument(ok, tracer_provider=provider, span_enricher=enrich)
+    outcome = await wrapped(ctx())  # the enricher's error is swallowed
+    assert outcome.value == "ok"
+
+
+async def test_span_enricher_failure_preserves_original_error() -> None:
+    provider, _ = tracing()
+
+    async def bad(c: InvocationContext) -> Outcome[Any]:
+        raise TransientError("down")
+
+    def enrich(span: Any, c: InvocationContext, outcome: Outcome[Any] | None, exc: BaseException | None) -> None:
+        raise RuntimeError("enricher boom")
+
+    wrapped = instrument(bad, tracer_provider=provider, span_enricher=enrich)
+    # The original error propagates, not the enricher's.
+    with pytest.raises(TransientError):
+        await wrapped(ctx())
+
+
+async def test_no_span_enricher_is_the_default_behaviour() -> None:
+    provider, exporter = tracing()
+    wrapped = instrument(ok, tracer_provider=provider)  # span_enricher defaults to None
+    await wrapped(ctx(operation="search.query"))
+
+    (span,) = exporter.get_finished_spans()
+    attrs = dict(span.attributes or {})
+    assert span.name == "search.query"
+    assert not any(k.startswith("app.") for k in attrs)

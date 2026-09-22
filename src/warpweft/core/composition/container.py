@@ -128,6 +128,7 @@ class Container:
         tracer_provider: Any,
         meter_provider: Any,
         telemetry: TelemetryConfig,
+        span_enricher: Any,
         framework_defaults: Mapping[str, Any],
         resolver: SettingsResolver,
         init_timeout: float,
@@ -147,6 +148,7 @@ class Container:
         self._tracer_provider = tracer_provider
         self._meter_provider = meter_provider
         self._telemetry = telemetry
+        self._span_enricher = span_enricher
         self._init_timeout = init_timeout
         self._drain_timeout = drain_timeout
         self._health_timeout = health_timeout
@@ -173,6 +175,7 @@ class Container:
         tracer_provider: Any = None,
         meter_provider: Any = None,
         telemetry: TelemetryConfig = DEFAULT_CONFIG,
+        span_enricher: Any = None,
         framework_defaults: Mapping[str, Any] | None = None,
         resolver: SettingsResolver | None = None,
         init_timeout: float = 30.0,
@@ -224,6 +227,7 @@ class Container:
             tracer_provider=tracer_provider,
             meter_provider=meter_provider,
             telemetry=telemetry,
+            span_enricher=span_enricher,
             framework_defaults=framework_defaults,
             resolver=resolver or DictSettingsResolver(),
             init_timeout=init_timeout,
@@ -447,6 +451,7 @@ class Container:
             tracer_provider=self._tracer_provider,
             meter_provider=self._meter_provider,
             config=self._telemetry,
+            span_enricher=self._span_enricher,
         )
 
     # --- health --------------------------------------------------------------

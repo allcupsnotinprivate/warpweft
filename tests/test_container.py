@@ -255,6 +255,31 @@ async def test_invoke_runs_the_method_and_wraps_the_result() -> None:
     await container.stop()
 
 
+async def test_span_enricher_is_forwarded_through_build() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    seen: list[tuple[Any, Any]] = []
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen.append((dict(ctx.arguments or {}), None if outcome is None else outcome.value))
+        span.set_attribute("app.echoed", outcome.value)
+
+    container = Container.build(
+        fresh_registry(),
+        {"echo": {"prefix": ">>"}},
+        tracer_provider=provider,
+        span_enricher=enrich,
+    )
+    await container.start()
+    await container.invoke("echo", "echo", text="hi")
+    await container.stop()
+
+    assert seen == [({"text": "hi"}, ">>hi")]
+    (span,) = exporter.get_finished_spans()
+    assert dict(span.attributes or {})["app.echoed"] == ">>hi"
+
+
 async def test_invoke_applies_retry_from_config() -> None:
     config = {"flaky": {"policy": {"retry": {"attempts": 3, "base_delay": 0.0, "max_delay": 1.0}}}}
     container = Container.build(fresh_registry(), config)
