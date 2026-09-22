@@ -282,7 +282,10 @@ def _wrap_method(
             correlation_id=(parent.correlation_id if parent is not None else None)
             or current_correlation_id()
             or uuid.uuid4().hex,
-            deadline=parent.deadline if parent is not None else None,
+            # The raw dependency path runs no timeout link, so an inherited
+            # deadline would never be enforced; leave it unset rather than expose
+            # a dead field that misleads a span_enricher/reader.
+            deadline=None,
             scope_key=scope_key,
             arguments=_arguments(method, args, kwargs),
             clock=clock or (parent.clock if parent is not None else None),

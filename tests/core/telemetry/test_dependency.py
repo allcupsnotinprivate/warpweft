@@ -555,11 +555,10 @@ async def test_bad_arity_falls_back_to_kwargs_and_raises_the_real_error() -> Non
     assert seen["dep.fetch"] == {}  # signature.bind failed -> kwargs-only (empty), positionals dropped
 
 
-@pytest.mark.characterization
-async def test_expired_deadline_is_inherited_but_not_enforced() -> None:
-    # CHARACTERIZATION: a dependency call inherits the caller's deadline into its
-    # ctx, but the raw (link-less) dependency path enforces nothing - the call runs
-    # to completion even when the budget is already spent.
+async def test_dependency_call_does_not_inherit_an_unenforceable_deadline() -> None:
+    # The raw (link-less) dependency path enforces no deadline, so it does not
+    # populate one: ctx.deadline is None on the dep span rather than a dead field
+    # that would mislead a span_enricher/reader. The call still runs to completion.
     seen: dict[str, float | None] = {}
 
     def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
@@ -585,8 +584,8 @@ async def test_expired_deadline_is_inherited_but_not_enforced() -> None:
     await container.start()
     outcome = await container.invoke("caller", "run", budget=0.001)
     await container.stop()
-    assert seen["slow.go"] is not None  # deadline inherited
-    assert outcome.value == "done"  # yet the dependency call was not cut off
+    assert seen["slow.go"] is None  # deadline not populated (it could not be enforced)
+    assert outcome.value == "done"  # and nothing was cut off
 
 
 async def test_correlation_id_propagates_invoke_to_nested_deps() -> None:
