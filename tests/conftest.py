@@ -60,6 +60,18 @@ def connect() -> Callable[..., AbstractAsyncContextManager[ClientSession]]:
     return connected
 
 
+@pytest.fixture
+def container() -> Callable[..., AbstractAsyncContextManager[Any]]:
+    """A container factory: ``async with container(A, B, config=...) as c: ...``.
+
+    Requesting it marks the test ``integration`` (see the tier auto-marker) and
+    folds away the build/start/stop boilerplate.
+    """
+    from _support.containers import running_container
+
+    return running_container
+
+
 @asynccontextmanager
 async def connected(
     app: App, *, elicitation_callback: ElicitationFnT | None = None, **server_kwargs: Any

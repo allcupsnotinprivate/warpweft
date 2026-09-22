@@ -26,8 +26,10 @@ jobs:
           uv run ruff format --check .
       - name: Type-check
         run: uv run mypy src
-      - name: Tests (coverage gate 90%)
-        run: uv run pytest --cov=warpweft --cov-report=term
+      - name: Unit tests
+        run: uv run pytest -m unit --cov=warpweft --cov-report= --cov-fail-under=0
+      - name: Integration & e2e tests (coverage gate 90%, appended)
+        run: uv run pytest -m "integration or e2e" --cov=warpweft --cov-append --cov-report=term
 
   wheel-smoke:
     name: wheel installs into clean venv

@@ -7,6 +7,7 @@ policy links. In-memory OTel providers per test; globals untouched.
 
 from typing import Any
 
+from _support.containers import registry_of
 from _support.otel import by_name, metering, points_by_operation, read, tracing
 from opentelemetry.trace import StatusCode
 import pytest
@@ -70,10 +71,7 @@ class UpperBad(AComponent[EmptySettings, None, str]):
 
 
 def fresh_registry() -> Registry:
-    reg = Registry()
-    for cls in (Dep, BadDep, Upper, UpperBad):
-        reg.register(cls)
-    return reg
+    return registry_of(Dep, BadDep, Upper, UpperBad)
 
 
 # --- spans and metrics -------------------------------------------------------

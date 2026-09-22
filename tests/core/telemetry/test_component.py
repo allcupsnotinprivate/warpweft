@@ -5,20 +5,22 @@ provider with ``warpweft.component`` and its slice's allowlisted axis pairs
 attached; outside, the property degrades to a process-wide no-op.
 """
 
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from typing import Any
 
 from _support.otel import metering, scoped_metrics, sole_point
 import pytest
 
 from warpweft.core.axes import Axis, AxisRegistry, ScopeSpec
 from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
-from warpweft.core.composition import Container, Registry
+from warpweft.core.composition import Container
 from warpweft.core.telemetry import conventions as conv
 from warpweft.core.telemetry.component import NOOP_TELEMETRY
 from warpweft.core.telemetry.instrument import TelemetryConfig
 
-pytestmark = [pytest.mark.integration, pytest.mark.anyio]
+#: A container factory; requesting it tags each test ``integration`` via the auto-marker.
+Make = Callable[..., AbstractAsyncContextManager[Container]]
 
 _tenant: ContextVar[str | None] = ContextVar("test_tenant", default=None)
 
@@ -72,25 +74,13 @@ class EagerMeterful(AComponent[EmptySettings, None, str]):
         return "ok"
 
 
-# --- helpers -----------------------------------------------------------------
-
-
-def _registry_of(*classes: type[AComponent[Any, Any, Any]]) -> Registry:
-    registry = Registry()
-    for cls in classes:
-        registry.register(cls)
-    return registry
-
-
 # --- inside a container ------------------------------------------------------
 
 
-async def test_component_metric_carries_the_component_attribute() -> None:
+async def test_component_metric_carries_the_component_attribute(container: Make) -> None:
     provider, reader = metering()
-    container = Container.build(_registry_of(Meterful), {"meterful": {}}, meter_provider=provider)
-    await container.start()
-    await container.invoke("meterful", "work")
-    await container.stop()
+    async with container(Meterful, config={"meterful": {}}, meter_provider=provider) as c:
+        await c.invoke("meterful", "work")
 
     metrics = scoped_metrics(reader, conv.INSTRUMENTATION_COMPONENT_NAME)
     counter = metrics["app.things"]
@@ -105,12 +95,10 @@ async def test_component_metric_carries_the_component_attribute() -> None:
     assert dict(histogram.attributes) == {conv.ATTR_COMPONENT: "meterful"}
 
 
-async def test_telemetry_cached_in_init_records_to_the_live_channel() -> None:
+async def test_telemetry_cached_in_init_records_to_the_live_channel(container: Make) -> None:
     provider, reader = metering()
-    container = Container.build(_registry_of(EagerMeterful), {"eager-meterful": {}}, meter_provider=provider)
-    await container.start()
-    await container.invoke("eager-meterful", "work")
-    await container.stop()
+    async with container(EagerMeterful, config={"eager-meterful": {}}, meter_provider=provider) as c:
+        await c.invoke("eager-meterful", "work")
 
     metric = scoped_metrics(reader, conv.INSTRUMENTATION_COMPONENT_NAME)["app.eager"]
     point = sole_point(metric)
@@ -118,23 +106,21 @@ async def test_telemetry_cached_in_init_records_to_the_live_channel() -> None:
     assert dict(point.attributes) == {conv.ATTR_COMPONENT: "eager-meterful"}
 
 
-async def test_scoped_component_axes_follow_the_allowlist() -> None:
+async def test_scoped_component_axes_follow_the_allowlist(container: Make) -> None:
     provider, reader = metering()
     axes = AxisRegistry()
     axes.register(Axis(name="tenant", resolver=_tenant.get))
-    container = Container.build(
-        _registry_of(TenantMeterful),
-        {"tenant-meterful": {}},
+    async with container(
+        TenantMeterful,
+        config={"tenant-meterful": {}},
         axes=axes,
         meter_provider=provider,
         telemetry=TelemetryConfig(axis_allowlist=frozenset({"acme"})),
-    )
-    await container.start()
-    _tenant.set("acme")
-    await container.invoke("tenant-meterful", "work")
-    _tenant.set("globex")
-    await container.invoke("tenant-meterful", "work")
-    await container.stop()
+    ) as c:
+        _tenant.set("acme")
+        await c.invoke("tenant-meterful", "work")
+        _tenant.set("globex")
+        await c.invoke("tenant-meterful", "work")
 
     metric = scoped_metrics(reader, conv.INSTRUMENTATION_COMPONENT_NAME)["app.tenant.things"]
     attr_sets = [dict(p.attributes) for p in metric.data.data_points]
@@ -144,25 +130,21 @@ async def test_scoped_component_axes_follow_the_allowlist() -> None:
     assert len(attr_sets) == 2
 
 
-async def test_user_attributes_cannot_overwrite_automatic_ones() -> None:
+async def test_user_attributes_cannot_overwrite_automatic_ones(container: Make) -> None:
     provider, reader = metering()
-    container = Container.build(_registry_of(Spoofer), {"spoofer": {}}, meter_provider=provider)
-    await container.start()
-    await container.invoke("spoofer", "work")
-    await container.stop()
+    async with container(Spoofer, config={"spoofer": {}}, meter_provider=provider) as c:
+        await c.invoke("spoofer", "work")
 
     point = sole_point(scoped_metrics(reader, conv.INSTRUMENTATION_COMPONENT_NAME)["app.spoofed"])
     assert dict(point.attributes)[conv.ATTR_COMPONENT] == "spoofer"
 
 
-async def test_instruments_are_cached_by_name() -> None:
+async def test_instruments_are_cached_by_name(container: Make) -> None:
     provider, _ = metering()
-    container = Container.build(_registry_of(Meterful), {"meterful": {}}, meter_provider=provider)
-    await container.start()
-    instance = await container.get(Meterful)
-    assert instance.telemetry.counter("app.things") is instance.telemetry.counter("app.things")
-    assert instance.telemetry.histogram("app.size") is instance.telemetry.histogram("app.size")
-    await container.stop()
+    async with container(Meterful, config={"meterful": {}}, meter_provider=provider) as c:
+        instance = await c.get(Meterful)
+        assert instance.telemetry.counter("app.things") is instance.telemetry.counter("app.things")
+        assert instance.telemetry.histogram("app.size") is instance.telemetry.histogram("app.size")
 
 
 # --- outside a container -----------------------------------------------------

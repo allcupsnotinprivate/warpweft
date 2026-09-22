@@ -2,6 +2,7 @@
 
 from typing import ClassVar
 
+from _support.containers import registry_of
 import pytest
 
 from warpweft.core.component import (
@@ -36,10 +37,7 @@ class Search(AComponent[EmptySettings, str, str]):
 
 
 def fresh_registry() -> Registry:
-    reg = Registry()
-    reg.register(Embedder)
-    reg.register(Search)
-    return reg
+    return registry_of(Embedder, Search)
 
 
 # --- annotation-declared dependencies ----------------------------------------

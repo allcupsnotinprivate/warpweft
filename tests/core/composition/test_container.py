@@ -3,6 +3,7 @@
 from contextvars import ContextVar
 from typing import Any
 
+from _support.containers import registry_of
 import anyio
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -140,10 +141,7 @@ class TenantThing(AComponent[EmptySettings, None, str]):
 
 
 def fresh_registry() -> Registry:
-    reg = Registry()
-    for cls in (DB, API, Echo, Flaky, CtxWanter, BoomA, BoomB, BoomC, TenantThing):
-        reg.register(cls)
-    return reg
+    return registry_of(DB, API, Echo, Flaky, CtxWanter, BoomA, BoomB, BoomC, TenantThing)
 
 
 def setup_function() -> None:
