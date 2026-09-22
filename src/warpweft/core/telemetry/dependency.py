@@ -249,12 +249,21 @@ def _wrap_method(
         it raises, fall back to the generic view so buggy inverse telemetry (or an
         un-introspectable target such as a bare mock) degrades rather than breaking
         the call.
+
+        A well-formed call is reported in the caller-facing shape, matching the
+        guarded path (see the caller_view / generic-view fixes for #45). The one
+        deliberate divergence is a **wrong-arity** call: ``signature.bind`` raises,
+        the positionals cannot be mapped to parameter names, and the underlying
+        method is about to raise the real ``TypeError`` anyway - so a best-effort
+        ``kwargs``-only view is recorded (positionals dropped) rather than guessing.
         """
         try:
             signature = inspect.signature(method)
             bound = signature.bind(*args, **kwargs).arguments
         except (TypeError, ValueError):
-            return dict(kwargs)  # no signature / bad arity: let the method raise the real error
+            # No introspectable signature, or wrong arity: best-effort kwargs-only
+            # (positionals dropped); the method itself then raises the real error.
+            return dict(kwargs)
         if caller_view is None:
             return _default_view(method, signature, bound)
         try:

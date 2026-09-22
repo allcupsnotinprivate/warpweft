@@ -522,11 +522,11 @@ async def test_reassigned_dependency_method_is_resolved_freshly() -> None:
     dep.fetch.assert_awaited_once_with("b")
 
 
-@pytest.mark.characterization
 async def test_bad_arity_falls_back_to_kwargs_and_raises_the_real_error() -> None:
-    # CHARACTERIZATION: a wrong-arity dependency call cannot be bound, so the proxy
-    # records kwargs only (positionals dropped) and lets the method's own TypeError
-    # propagate.
+    # Documented, intentional divergence (#64): a wrong-arity dependency call cannot
+    # be bound to parameter names, so the proxy records a best-effort kwargs-only
+    # view (positionals dropped) and lets the method's own TypeError propagate.
+    # Well-formed calls are reported in the caller-facing shape (see #45).
     seen: dict[str, dict[str, Any]] = {}
 
     def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
