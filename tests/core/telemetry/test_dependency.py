@@ -114,6 +114,36 @@ async def test_dependency_call_emits_a_child_span_and_the_metrics() -> None:
     assert duration[("dep.fetch", conv.STATUS_OK)].count == 1
 
 
+async def test_dependency_outcome_is_reported_not_rewrapped() -> None:
+    # #44: a method that returns its own Outcome (a degraded, cached result) must
+    # have the span reflect that source/degraded/attempts, not dataclass defaults.
+    tracer_provider, exporter = tracing()
+    meter_provider, reader = metering()
+
+    class Cache:
+        async def load(self, key: str) -> Outcome[str]:
+            return Outcome(value=f"v:{key}", source="cache", degraded=True, attempts=2)
+
+    proxy = DependencyTelemetryProxy(
+        Cache(),
+        component="cache",
+        methods=("load",),
+        scope_key=GLOBAL_SCOPE,
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+    )
+    assert await proxy.load("k") == "v:k"  # caller still receives the bare value
+
+    (span,) = by_name(exporter.get_finished_spans(), "cache.load")
+    attrs = dict(span.attributes or {})
+    assert attrs[conv.ATTR_SOURCE] == "cache"
+    assert attrs[conv.ATTR_DEGRADED] is True
+    assert attrs[conv.ATTR_ATTEMPTS] == 2
+
+    degradations = points_by_operation(read(reader)[conv.METRIC_DEGRADATIONS])
+    assert degradations[("cache.load", "")].value == 1  # a degradation point is emitted
+
+
 async def test_dependency_policies_do_not_run_on_raw_calls() -> None:
     # dep configures retry, but the injected proxy runs no policy links: the
     # first failure flies up to upper's own retry, which re-invokes the whole

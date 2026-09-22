@@ -202,9 +202,12 @@ def _wrap_method(
 
     async def base(ctx: InvocationContext) -> Outcome[Any]:
         args, kwargs = ctx.bag.pop(_CALL_KEY)
-        # Always wrap, even an Outcome-returning method: the caller-facing
-        # wrapper returns ``outcome.value``, so the raw result is preserved.
-        return Outcome(value=await method(*args, **kwargs))
+        # A method may report its own degradation by returning an ``Outcome``
+        # (source/degraded/attempts); pass it through so the span reflects what
+        # the dependency actually reported, and only wrap a bare value. Mirrors
+        # ``make_base`` on the guarded path.
+        result = await method(*args, **kwargs)
+        return result if isinstance(result, Outcome) else Outcome(value=result)
 
     instrumented: Next = instrument(base, **instrument_kwargs)
 
