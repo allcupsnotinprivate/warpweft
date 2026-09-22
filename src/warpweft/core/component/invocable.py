@@ -65,10 +65,18 @@ class InputBinding:
     actually invoked with. A higher layer attaches this when an invocable's input
     is not the usual one-field-per-parameter form; absent otherwise. Core only
     consumes it - it never depends on why a layer chose a particular shape.
+
+    ``caller_view`` is the inverse of ``bind``: it maps a method's bound
+    arguments back to the flat, caller-facing fields. Only the raw
+    dependency-call path needs it, to report ``ctx.arguments`` in the same shape
+    as the guarded path (a ``span_enricher`` then reads the same keys either
+    way). ``None`` when the binding has no computable inverse; the caller then
+    falls back to a generic per-parameter view.
     """
 
     model: type[BaseModel]
     bind: Callable[[Mapping[str, Any]], dict[str, Any]]
+    caller_view: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None
 
 
 def set_input_binding(fn: F, binding: InputBinding) -> F:
@@ -94,6 +102,11 @@ class InvocableSpec:
     #: passes them through unchanged; a custom binder (from an `InputBinding`)
     #: rebuilds a richer shape, e.g. a single model parameter.
     arg_binder: Callable[[Mapping[str, Any]], dict[str, Any]] = _by_parameter
+    #: Inverse of ``arg_binder`` for the raw dependency-call path: maps a method's
+    #: bound arguments back to the flat caller-facing fields so that path reports
+    #: ``ctx.arguments`` in the same shape as the guarded path. ``None`` (the
+    #: default-binder case) leaves the dependency path to a generic view.
+    caller_view: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None
 
     def input_json_schema(self) -> dict[str, Any]:
         return self.input_model.model_json_schema()

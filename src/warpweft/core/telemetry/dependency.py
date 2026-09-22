@@ -18,10 +18,10 @@ reports the wrapped instance's class as its ``__class__`` (the same mechanism
 ``unittest.mock`` uses). Subclassing the proxy is not supported.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Mapping
 import functools
 import inspect
-from typing import Any, Final
+from typing import Any, Final, get_type_hints
 import uuid
 
 from warpweft.core.axes import ScopeKey
@@ -36,6 +36,10 @@ from .instrument import DEFAULT_CONFIG, SpanEnricher, TelemetryConfig, instrumen
 #: Bag key carrying the raw ``(args, kwargs)`` of a call to the base link, so
 #: the method is invoked exactly as the caller wrote it (positionals intact).
 _CALL_KEY: Final = "warpweft.dependency.call"
+
+#: Inverse of an invocable's ``arg_binder``: maps a method's bound arguments back
+#: to the flat, caller-facing fields (see `InputBinding.caller_view`).
+CallerView = Callable[[Mapping[str, Any]], dict[str, Any]]
 
 
 class DependencyTelemetryProxy:
@@ -64,7 +68,7 @@ class DependencyTelemetryProxy:
         instance: object,
         *,
         component: str,
-        methods: Iterable[str],
+        methods: Mapping[str, CallerView | None],
         scope_key: ScopeKey,
         clock: Clock | None = None,
         tracer_provider: Any = None,
@@ -78,7 +82,12 @@ class DependencyTelemetryProxy:
         object.__setattr__(self, "_ww_component", component)
         # A callable dependency guards+instruments itself via its own chain, so
         # leave its methods raw (see class docstring); everyone else is wrapped.
-        object.__setattr__(self, "_ww_methods", frozenset() if callable(instance) else frozenset(methods))
+        # ``methods`` maps each instrumented name to its optional caller-view
+        # (the inverse of the invocable's arg_binder, used to report
+        # caller-facing ``ctx.arguments``); ``None`` falls back to a generic view.
+        raw = {} if callable(instance) else dict(methods)
+        object.__setattr__(self, "_ww_methods", frozenset(raw))
+        object.__setattr__(self, "_ww_caller_views", raw)
         object.__setattr__(self, "_ww_scope_key", scope_key)
         object.__setattr__(self, "_ww_clock", clock)
         object.__setattr__(
@@ -112,6 +121,7 @@ class DependencyTelemetryProxy:
                     scope_key=self._ww_scope_key,
                     clock=self._ww_clock,
                     instrument_kwargs=self._ww_instrument_kwargs,
+                    caller_view=self._ww_caller_views.get(item),
                 )
                 wrappers[item] = wrapper
             return wrapper
@@ -196,9 +206,46 @@ def _wrap_method(
     scope_key: ScopeKey,
     clock: Clock | None,
     instrument_kwargs: dict[str, Any],
+    caller_view: CallerView | None = None,
 ) -> Any:
     """Build one instrumented wrapper around a bound invocable method."""
     signature = inspect.signature(method)
+    hints = get_type_hints(method)
+    ctx_param = next(
+        (name for name in signature.parameters if hints.get(name) is InvocationContext),
+        None,
+    )
+
+    def _generic_view(bound: Mapping[str, Any]) -> dict[str, Any]:
+        """The default-binder caller view: each regular parameter maps 1:1,
+        ``**kwargs`` is flattened up, and ``*args`` / the `InvocationContext`
+        parameter are dropped - the shape the guarded path (``**arguments`` only,
+        no defaults) produces."""
+        flat: dict[str, Any] = {}
+        for name, param in signature.parameters.items():
+            if name not in bound or name == ctx_param:
+                continue
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                flat.update(bound[name])
+            elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+                continue
+            else:
+                flat[name] = bound[name]
+        return flat
+
+    def _caller_arguments(bound: Mapping[str, Any]) -> dict[str, Any]:
+        """Present the bound call as the guarded path's flat, caller-facing view.
+
+        A custom binding supplies the inverse (``caller_view``) directly; when it
+        raises, or for a default binder, fall back to the generic view so buggy
+        inverse telemetry degrades rather than breaking the call.
+        """
+        if caller_view is None:
+            return _generic_view(bound)
+        try:
+            return dict(caller_view(bound))
+        except Exception:  # telemetry must never break the call
+            return _generic_view(bound)
 
     async def base(ctx: InvocationContext) -> Outcome[Any]:
         args, kwargs = ctx.bag.pop(_CALL_KEY)
@@ -214,7 +261,7 @@ def _wrap_method(
     @functools.wraps(method)
     async def call(*args: Any, **kwargs: Any) -> Any:
         try:
-            arguments = dict(signature.bind(*args, **kwargs).arguments)
+            arguments = _caller_arguments(signature.bind(*args, **kwargs).arguments)
         except TypeError:
             arguments = dict(kwargs)  # let the method itself raise the real error
         parent = current_context()
