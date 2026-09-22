@@ -79,6 +79,73 @@ operation/axes - bounded). **Manual** transitions via
 `Container.force_open_breakers` / `reset_breakers` happen outside any
 invocation and are logged only - no metric point.
 
+## Dependency calls
+
+Telemetry is end to end: when the container injects a dependency into a
+component, it injects a lightweight telemetry proxy, not the bare instance.
+Every call to one of the dependency's `@invocable` methods then carries the
+full observability contract above - a `<component>.<method>` span (a child of
+the caller's invocation span, inheriting its correlation id), the
+`warpweft.calls` and `warpweft.call.duration` metrics with the same attributes
+and axis cardinality policy, and the `span_enricher` hook. Like the rest of
+telemetry, this is always on and free of cost until an SDK is configured.
+
+What the proxy deliberately does **not** do is run policy links: the
+dependency's retry, breaker or cache would double up with the caller's own
+chain, so a raw dependency call stays raw - it only becomes visible. An error
+in the dependency propagates unchanged (recorded as an error point with its
+`warpweft.error.class`); recovering from it is the caller's chain's business.
+Guarded invocations (`invoke` / `proxy`) are untouched: their chains are built
+on the bare instance, so nothing is counted twice.
+
+Boundaries to know:
+
+- Calls a component makes to **itself** (`self.method()`) are not proxied and
+  stay uninstrumented - telemetry sits on the component boundary.
+- `container.get(...)` returns the bare instance; only *injected* dependencies
+  are proxied.
+- `isinstance` checks against the dependency's class keep working on the proxy
+  (it reports the wrapped instance's class as its `__class__`), but
+  `type(dep) is DepClass` does not, and the proxy cannot be subclassed.
+- A callable dependency (an `Action`) called as `self.dep(...)` routes through
+  its own invoker and full chain - instrumented there, not by the proxy.
+
+## Component metrics
+
+Components record their own domain metrics - tokens consumed, rows synced -
+through `self.telemetry`, with no meter plumbing:
+
+```python
+class Llm(AComponent[LlmSettings, Prompt, str]):
+    @invocable
+    async def complete(self, prompt: str) -> str:
+        answer, used = await self._client.complete(prompt)
+        self.telemetry.counter("o2.llm.tokens", unit="{token}").add(used, {"model": self._model})
+        return answer
+```
+
+`counter(name, *, unit="", description="")` and
+`histogram(name, *, unit="", description="")` return cached-by-name
+instruments with `.add(value, attributes=None)` / `.record(value,
+attributes=None)`. Metric names are entirely yours - no prefix is imposed.
+
+Every recorded point automatically carries:
+
+- `warpweft.component` - the component's name;
+- `warpweft.axis.<name>` for the instance's slice (scoped components), subject
+  to the same `axis_allowlist` cardinality policy as the framework metrics -
+  values outside the allowlist are dropped.
+
+User attributes merge underneath the automatic ones and cannot overwrite them.
+
+The container binds a live channel to every instance it creates (a scoped
+component gets one per slice, so per-tenant breakdown needs no code), recording
+through the container's meter provider under the instrumentation scope
+`warpweft.component` - separate from the `warpweft` scope, whose metric names
+are the framework's stability contract. A component constructed directly (unit
+tests) gets a process-wide no-op: every call is accepted, nothing is recorded,
+nothing fails.
+
 ## Enriching the invocation span
 
 The framework attaches only its own vendor-neutral attributes. To record
