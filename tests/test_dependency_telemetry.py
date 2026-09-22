@@ -15,12 +15,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 import pytest
 
+from warpweft.core.axes import GLOBAL_SCOPE
 from warpweft.core.component import AComponent, EmptySettings, invocable
 from warpweft.core.composition import Container, Registry
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import PermanentError, TransientError
 from warpweft.core.outcome import Outcome
 from warpweft.core.telemetry import conventions as conv
+from warpweft.core.telemetry.dependency import DependencyTelemetryProxy
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -170,6 +172,104 @@ async def test_dependency_policies_do_not_run_on_raw_calls() -> None:
     assert outcome.attempts == 2  # upper's retry recovered
     assert dep.calls == 2  # dep's own retry never ran (would have been 2 calls in 1 attempt)
     await container.stop()
+
+
+# --- proxy transparency ------------------------------------------------------
+
+
+class _Widget:
+    """A value-like, container-like, context-manager-like dependency stand-in."""
+
+    def __init__(self, items: list[int]) -> None:
+        self.items = items
+        self.entered = False
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+    def __contains__(self, x: int) -> bool:
+        return x in self.items
+
+    def __iter__(self) -> Any:
+        return iter(self.items)
+
+    def __getitem__(self, i: int) -> int:
+        return self.items[i]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Widget) and other.items == self.items
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.items))
+
+    def __repr__(self) -> str:
+        return f"_Widget({self.items!r})"
+
+    async def __aenter__(self) -> str:
+        self.entered = True
+        return "conn"
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        self.entered = False
+        return False
+
+
+def _proxy_for(instance: object, methods: tuple[str, ...] = ()) -> Any:
+    return DependencyTelemetryProxy(instance, component="w", methods=methods, scope_key=GLOBAL_SCOPE)
+
+
+async def test_proxy_forwards_object_protocols() -> None:
+    inst = _Widget([1, 2, 3])
+    proxy = _proxy_for(inst)
+
+    assert isinstance(proxy, _Widget)  # __class__ spoof
+    assert len(proxy) == 3
+    assert bool(proxy) is True
+    assert bool(_proxy_for(_Widget([]))) is False
+    assert 2 in proxy
+    assert list(proxy) == [1, 2, 3]
+    assert proxy[0] == 1
+    assert repr(proxy) == "_Widget([1, 2, 3])"  # not the wrapper's repr
+
+    async with proxy as conn:  # (async) context-manager protocol forwards
+        assert conn == "conn"
+        assert inst.entered is True
+    assert inst.entered is False
+
+
+async def test_proxy_equals_and_hashes_like_the_wrapped_instance() -> None:
+    inst = _Widget([1, 2, 3])
+    proxy = _proxy_for(inst)
+
+    assert proxy == inst
+    assert inst == proxy
+    assert proxy == _Widget([1, 2, 3])
+    assert hash(proxy) == hash(inst)
+    assert {proxy, inst} == {inst}  # interchangeable as set members
+    assert proxy is not inst  # identity still cannot be forwarded
+
+
+async def test_callable_dependency_methods_are_not_proxy_instrumented() -> None:
+    # A callable dependency (an Action) guards+instruments itself via its own
+    # chain; the proxy must not add a second, unguarded span for its invocables.
+    provider, exporter = tracing()
+
+    class Act:
+        def __call__(self) -> str:
+            return "called"
+
+        async def run(self) -> str:
+            return "raw"
+
+    proxy = DependencyTelemetryProxy(
+        Act(), component="act", methods=("run",), scope_key=GLOBAL_SCOPE, tracer_provider=provider
+    )
+    assert proxy() == "called"  # __call__ forwards to the instance's own chain
+    assert await proxy.run() == "raw"  # invocable is left raw, not wrapped
+    assert exporter.get_finished_spans() == ()  # no proxy-emitted span
 
 
 async def test_dependency_error_sets_status_and_error_class_and_propagates() -> None:

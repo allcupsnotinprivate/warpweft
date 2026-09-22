@@ -58,6 +58,21 @@ class Spoofer(AComponent[EmptySettings, None, str]):
         return "ok"
 
 
+class EagerMeterful(AComponent[EmptySettings, None, str]):
+    name = "eager-meterful"
+
+    def __init__(self, settings: EmptySettings) -> None:
+        super().__init__(settings)
+        # Cache the instrument at construction: it must bind to the live channel,
+        # not the no-op, so runtime .add() calls are actually recorded.
+        self._counter = self.telemetry.counter("app.eager")
+
+    @invocable
+    async def work(self) -> str:
+        self._counter.add(3)
+        return "ok"
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -112,6 +127,19 @@ async def test_component_metric_carries_the_component_attribute() -> None:
     assert histogram.count == 1
     assert histogram.sum == pytest.approx(1.5)
     assert dict(histogram.attributes) == {conv.ATTR_COMPONENT: "meterful"}
+
+
+async def test_telemetry_cached_in_init_records_to_the_live_channel() -> None:
+    provider, reader = metering()
+    container = Container.build(_registry_of(EagerMeterful), {"eager-meterful": {}}, meter_provider=provider)
+    await container.start()
+    await container.invoke("eager-meterful", "work")
+    await container.stop()
+
+    metric = scoped_metrics(reader, conv.INSTRUMENTATION_COMPONENT_NAME)["app.eager"]
+    point = sole_point(metric)
+    assert point.value == 3  # not silently dropped by an __init__-time no-op
+    assert dict(point.attributes) == {conv.ATTR_COMPONENT: "eager-meterful"}
 
 
 async def test_scoped_component_axes_follow_the_allowlist() -> None:

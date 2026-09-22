@@ -18,7 +18,9 @@ prefix is imposed. The meter uses its own instrumentation scope,
 ``warpweft`` scope whose names are the framework's stability contract.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Final
 
 from opentelemetry import metrics
@@ -107,3 +109,24 @@ def component_meter(meter_provider: Any = None) -> metrics.Meter:
 
 #: Fallback for components created outside a container: records nothing, never fails.
 NOOP_TELEMETRY: Final = ComponentTelemetry("", GLOBAL_SCOPE, NoOpMeter(conv.INSTRUMENTATION_COMPONENT_NAME))
+
+
+#: The telemetry channel the container binds *around* a component's construction,
+#: so ``self.telemetry`` already works inside ``__init__`` (an instrument cached
+#: there then points at the live channel, not the no-op). ``None`` outside a build.
+_CONSTRUCTING: ContextVar[ComponentTelemetry | None] = ContextVar("warpweft_component_telemetry", default=None)
+
+
+@contextmanager
+def binding_telemetry(telemetry: ComponentTelemetry) -> Iterator[None]:
+    """Expose ``telemetry`` to ``AComponent.telemetry`` for the duration of construction."""
+    token = _CONSTRUCTING.set(telemetry)
+    try:
+        yield
+    finally:
+        _CONSTRUCTING.reset(token)
+
+
+def constructing_telemetry() -> ComponentTelemetry | None:
+    """The telemetry channel bound around the component currently being constructed, if any."""
+    return _CONSTRUCTING.get()

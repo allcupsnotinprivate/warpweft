@@ -45,6 +45,18 @@ class DependencyTelemetryProxy:
     instance; only the listed ``methods`` are substituted with instrumented
     wrappers (built lazily, cached per method). A wrapper returns the method's
     raw value, so ``await dep.fetch()`` reads exactly like a raw call.
+
+    Transparency covers the object protocols too: ``==``/``hash``, ``repr``,
+    truthiness, iteration, indexing, ``in`` and the (async) context-manager
+    protocol all forward to the wrapped instance, because Python resolves those
+    dunders on the type rather than via ``__getattr__``. Identity (``is``)
+    cannot be forwarded - the proxy is a distinct object - so compare by value.
+
+    A **callable** dependency (an Action) is left entirely raw: its call already
+    runs through its own guarded, instrumented chain via ``__call__``, and
+    instrumenting ``execute`` here would add a second, *unguarded*
+    ``<component>.execute`` span that silently drops the author's retry/breaker/
+    cache. So a callable dependency exposes no instrumented methods.
     """
 
     def __init__(
@@ -64,7 +76,9 @@ class DependencyTelemetryProxy:
         # Own state bypasses __setattr__, which forwards to the instance.
         object.__setattr__(self, "_ww_instance", instance)
         object.__setattr__(self, "_ww_component", component)
-        object.__setattr__(self, "_ww_methods", frozenset(methods))
+        # A callable dependency guards+instruments itself via its own chain, so
+        # leave its methods raw (see class docstring); everyone else is wrapped.
+        object.__setattr__(self, "_ww_methods", frozenset() if callable(instance) else frozenset(methods))
         object.__setattr__(self, "_ww_scope_key", scope_key)
         object.__setattr__(self, "_ww_clock", clock)
         object.__setattr__(
@@ -106,13 +120,73 @@ class DependencyTelemetryProxy:
     def __setattr__(self, name: str, value: Any) -> None:
         setattr(self._ww_instance, name, value)
 
+    def __delattr__(self, name: str) -> None:
+        delattr(self._ww_instance, name)
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         # A callable dependency (an Action) routes its call through its own
         # invoker and full chain - instrumented there; no proxy telemetry here.
         return self._ww_instance(*args, **kwargs)
 
+    # --- object-protocol transparency ---------------------------------------
+    # These dunders are resolved on the type, so __getattr__ never sees them;
+    # each forwards to the wrapped instance to keep the proxy transparent.
     def __repr__(self) -> str:
-        return f"<telemetry proxy for {self._ww_instance!r}>"
+        return repr(self._ww_instance)
+
+    def __str__(self) -> str:
+        return str(self._ww_instance)
+
+    def __format__(self, format_spec: str) -> str:
+        return format(self._ww_instance, format_spec)
+
+    def __eq__(self, other: object) -> bool:
+        return bool(self._ww_instance == other)
+
+    def __ne__(self, other: object) -> bool:
+        return bool(self._ww_instance != other)
+
+    def __hash__(self) -> int:
+        return hash(self._ww_instance)
+
+    def __bool__(self) -> bool:
+        return bool(self._ww_instance)
+
+    def __len__(self) -> int:
+        return len(self._ww_instance)
+
+    def __contains__(self, item: Any) -> bool:
+        return item in self._ww_instance
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._ww_instance[key]
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._ww_instance[key] = value
+
+    def __delitem__(self, key: Any) -> None:
+        del self._ww_instance[key]
+
+    def __iter__(self) -> Any:
+        return iter(self._ww_instance)
+
+    def __reversed__(self) -> Any:
+        return reversed(self._ww_instance)
+
+    def __enter__(self) -> Any:
+        return self._ww_instance.__enter__()
+
+    def __exit__(self, *exc_info: Any) -> Any:
+        return self._ww_instance.__exit__(*exc_info)
+
+    def __aiter__(self) -> Any:
+        return self._ww_instance.__aiter__()
+
+    async def __aenter__(self) -> Any:
+        return await self._ww_instance.__aenter__()
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        return await self._ww_instance.__aexit__(*exc_info)
 
 
 def _wrap_method(

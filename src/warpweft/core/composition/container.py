@@ -41,7 +41,7 @@ from warpweft.core.pipeline.builtin.concurrency import ConcurrencyInterceptor
 from warpweft.core.pipeline.chain import build_chain, compose
 from warpweft.core.pipeline.interceptor import Next
 from warpweft.core.pipeline.state import InMemoryStateStore
-from warpweft.core.telemetry.component import ComponentTelemetry, component_meter
+from warpweft.core.telemetry.component import ComponentTelemetry, binding_telemetry, component_meter
 from warpweft.core.telemetry.dependency import DependencyTelemetryProxy
 from warpweft.core.telemetry.instrument import DEFAULT_CONFIG, TelemetryConfig, instrument
 
@@ -465,16 +465,18 @@ class Container:
         reg = self._registrations[name]
         config = self._assemble(name, scope_key)
         own = reg.descriptor.settings_model
-        if own is None:
-            instance = reg.cls(config)
-        else:
-            settings = own.model_validate(config.model_dump(exclude={POLICY_FIELD}))
-            instance = reg.cls(settings)
         # Domain-metrics channel: each instance gets its own, carrying the
-        # component name and the slice's axis pairs (allowlist-filtered).
-        instance._ww_telemetry = ComponentTelemetry(
-            name, scope_key, self._component_meter, self._telemetry.axis_allowlist
-        )
+        # component name and the slice's axis pairs (allowlist-filtered). It is
+        # bound *around* construction so ``self.telemetry`` already works (and
+        # any instrument cached) inside ``__init__``.
+        telemetry = ComponentTelemetry(name, scope_key, self._component_meter, self._telemetry.axis_allowlist)
+        with binding_telemetry(telemetry):
+            if own is None:
+                instance = reg.cls(config)
+            else:
+                settings = own.model_validate(config.model_dump(exclude={POLICY_FIELD}))
+                instance = reg.cls(settings)
+        instance._ww_telemetry = telemetry
         return instance, config
 
     def _build_chain(self, instance: AComponent[Any, Any, Any], name: str, method: str, config: BaseModel) -> Next:
