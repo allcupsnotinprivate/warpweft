@@ -5,17 +5,21 @@ The container wraps every injected dependency in a telemetry proxy: each
 policy links. In-memory OTel providers per test; globals untouched.
 """
 
+from collections.abc import Mapping
 from typing import Any
+from unittest.mock import AsyncMock
 
 from _support.axes import context_axes
 from _support.containers import registry_of
 from _support.otel import axis_attrs_of, by_name, metering, points_by_operation, read, tracing
 import anyio
 from opentelemetry.trace import StatusCode
+from pydantic import BaseModel
 import pytest
 
 from warpweft.core.axes import GLOBAL_SCOPE, ScopeSpec
 from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
+from warpweft.core.component.invocable import InputBinding, set_input_binding
 from warpweft.core.composition import Container, Registry
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import PermanentError, TransientError
@@ -114,6 +118,36 @@ async def test_dependency_call_emits_a_child_span_and_the_metrics() -> None:
     assert duration[("dep.fetch", conv.STATUS_OK)].count == 1
 
 
+async def test_dependency_outcome_is_reported_not_rewrapped() -> None:
+    # #44: a method that returns its own Outcome (a degraded, cached result) must
+    # have the span reflect that source/degraded/attempts, not dataclass defaults.
+    tracer_provider, exporter = tracing()
+    meter_provider, reader = metering()
+
+    class Cache:
+        async def load(self, key: str) -> Outcome[str]:
+            return Outcome(value=f"v:{key}", source="cache", degraded=True, attempts=2)
+
+    proxy = DependencyTelemetryProxy(
+        Cache(),
+        component="cache",
+        methods={"load": None},
+        scope_key=GLOBAL_SCOPE,
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+    )
+    assert await proxy.load("k") == "v:k"  # caller still receives the bare value
+
+    (span,) = by_name(exporter.get_finished_spans(), "cache.load")
+    attrs = dict(span.attributes or {})
+    assert attrs[conv.ATTR_SOURCE] == "cache"
+    assert attrs[conv.ATTR_DEGRADED] is True
+    assert attrs[conv.ATTR_ATTEMPTS] == 2
+
+    degradations = points_by_operation(read(reader)[conv.METRIC_DEGRADATIONS])
+    assert degradations[("cache.load", "")].value == 1  # a degradation point is emitted
+
+
 async def test_dependency_policies_do_not_run_on_raw_calls() -> None:
     # dep configures retry, but the injected proxy runs no policy links: the
     # first failure flies up to upper's own retry, which re-invokes the whole
@@ -177,8 +211,8 @@ class _Widget:
         return False
 
 
-def _proxy_for(instance: object, methods: tuple[str, ...] = ()) -> Any:
-    return DependencyTelemetryProxy(instance, component="w", methods=methods, scope_key=GLOBAL_SCOPE)
+def _proxy_for(instance: object, methods: Mapping[str, Any] | None = None) -> Any:
+    return DependencyTelemetryProxy(instance, component="w", methods=methods or {}, scope_key=GLOBAL_SCOPE)
 
 
 async def test_proxy_forwards_object_protocols() -> None:
@@ -225,7 +259,7 @@ async def test_callable_dependency_methods_are_not_proxy_instrumented() -> None:
             return "raw"
 
     proxy = DependencyTelemetryProxy(
-        Act(), component="act", methods=("run",), scope_key=GLOBAL_SCOPE, tracer_provider=provider
+        Act(), component="act", methods={"run": None}, scope_key=GLOBAL_SCOPE, tracer_provider=provider
     )
     assert proxy() == "called"  # __call__ forwards to the instance's own chain
     assert await proxy.run() == "raw"  # invocable is left raw, not wrapped
@@ -394,6 +428,98 @@ async def test_positional_dependency_call_captures_named_arguments() -> None:
     await container.invoke("up", "run")
     await container.stop()
     assert seen["dep.fetch"] == {"x": 1}  # positional mapped to the parameter name via signature.bind
+
+
+async def test_kwargs_dependency_call_reports_flat_arguments() -> None:
+    # #45: a **kwargs method's ctx.arguments must be flat on the dependency path,
+    # matching the guarded path - not nested under the VAR_KEYWORD parameter name.
+    seen: dict[str, dict[str, Any]] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = dict(ctx.arguments or {})
+
+    class Dep(AComponent[EmptySettings, None, str]):
+        name = "dep"
+
+        @invocable
+        async def fetch(self, **filters: Any) -> str:
+            return ",".join(f"{k}={v}" for k, v in sorted(filters.items()))
+
+    class Up(AComponent[EmptySettings, None, str]):
+        name = "up"
+        dependencies = ("dep",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("dep").fetch(a=1, b=2)
+
+    container = Container.build(registry_of(Dep, Up), {"dep": {}, "up": {}}, span_enricher=enrich)
+    await container.start()
+    await container.invoke("up", "run")
+    await container.stop()
+    assert seen["dep.fetch"] == {"a": 1, "b": 2}  # flattened, not {"filters": {...}}
+
+
+async def test_boxed_binding_dependency_call_reports_caller_facing_fields() -> None:
+    # #45 repro: an invocable with a custom InputBinding (flat fields -> one model
+    # param) must report the flat caller-facing fields on the dependency path, so a
+    # span_enricher reads the same keys as on the guarded path.
+    seen: dict[str, dict[str, Any]] = {}
+
+    def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
+        seen[ctx.operation] = dict(ctx.arguments or {})
+
+    class Query(BaseModel):
+        field_a: int
+        field_b: str
+
+    class Dep(AComponent[EmptySettings, None, str]):
+        name = "dep"
+
+        @invocable
+        async def search(self, query: Query) -> str:
+            return f"{query.field_a}:{query.field_b}"
+
+    set_input_binding(
+        Dep.search,
+        InputBinding(
+            model=Query,
+            bind=lambda args: {"query": Query.model_validate(dict(args))},
+            caller_view=lambda kwargs: dict(kwargs["query"].model_dump()),
+        ),
+    )
+
+    class Up(AComponent[EmptySettings, None, str]):
+        name = "up"
+        dependencies = ("dep",)
+
+        @invocable
+        async def run(self) -> str:
+            return await self.dependency("dep").search(Query(field_a=1, field_b="x"))
+
+    container = Container.build(registry_of(Dep, Up), {"dep": {}, "up": {}}, span_enricher=enrich)
+    await container.start()
+    await container.invoke("up", "run")
+    await container.stop()
+    assert seen["dep.search"] == {"field_a": 1, "field_b": "x"}  # flat, not {"query": <model>}
+
+
+async def test_reassigned_dependency_method_is_resolved_freshly() -> None:
+    # #46: the proxy must resolve the current attribute per call, so an invocable
+    # swapped on a long-lived (PROCESS) instance after wiring is honoured - the
+    # proxied path matches a bare-instance call, not the originally-captured method.
+    container = Container.build(fresh_registry(), {"dep": {}, "upper": {}})
+    await container.start()
+
+    assert (await container.invoke("upper", "run", tag="a")).value == "data:a"  # builds+caches the wrapper
+
+    dep = await container.get(Dep)
+    dep.fetch = AsyncMock(return_value="mocked")  # reassign after wiring
+
+    outcome = await container.invoke("upper", "run", tag="b")
+    await container.stop()
+    assert outcome.value == "mocked"  # the proxied call reached the swapped-in mock
+    dep.fetch.assert_awaited_once_with("b")
 
 
 @pytest.mark.characterization

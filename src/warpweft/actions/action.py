@@ -69,12 +69,19 @@ def _box_input(execute: Any, param: str, model: type[BaseModel]) -> None:
     The action's caller-facing contract is ``model``'s flat fields; on the way in
     those fields are rebuilt into the one ``param`` model the method declares. This
     is the only place that knows an action is "boxed" - core just runs the binder.
+
+    ``caller_view`` is the inverse - the boxed ``param`` model flattened back to
+    its fields - so the raw dependency-call path can report ``ctx.arguments`` in
+    the same flat shape the guarded path uses.
     """
 
     def bind(arguments: Mapping[str, Any]) -> dict[str, Any]:
         return {param: model.model_validate(dict(arguments))}
 
-    set_input_binding(execute, InputBinding(model=model, bind=bind))
+    def caller_view(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(kwargs[param].model_dump())
+
+    set_input_binding(execute, InputBinding(model=model, bind=bind, caller_view=caller_view))
 
 
 def _flatten(params: Any, fields: Mapping[str, Any]) -> dict[str, Any]:

@@ -102,6 +102,7 @@ def describe(
                 output_adapter=build_output_adapter(member),
                 policy=effective,
                 arg_binder=binding.bind,
+                caller_view=binding.caller_view,
             )
         else:
             invocables[method_name] = InvocableSpec(

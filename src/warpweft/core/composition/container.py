@@ -421,7 +421,7 @@ class Container:
             DependencyTelemetryProxy(
                 instance,
                 component=name,
-                methods=frozenset(reg.descriptor.invocables),
+                methods={n: spec.caller_view for n, spec in reg.descriptor.invocables.items()},
                 scope_key=scope_key,
                 clock=self._clock,
                 tracer_provider=self._tracer_provider,
