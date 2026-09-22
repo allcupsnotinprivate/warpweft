@@ -64,6 +64,26 @@ def points_by_operation(metric: Metric) -> dict[tuple[Any, Any], Any]:
     return points
 
 
+def points_by_attrs(metric: Metric, *attr_names: str) -> dict[tuple[Any, ...], Any]:
+    """Data points keyed by the values of ``attr_names`` (missing → ``None``)."""
+    points: dict[tuple[Any, ...], Any] = {}
+    for p in metric.data.data_points:
+        attrs = dict(p.attributes or {})
+        points[tuple(attrs.get(name) for name in attr_names)] = p
+    return points
+
+
 def by_name(spans: tuple[ReadableSpan, ...], name: str) -> list[ReadableSpan]:
     """The finished spans whose name is exactly ``name``."""
     return [s for s in spans if s.name == name]
+
+
+def axis_attrs_of(carrier: Any) -> dict[str, Any]:
+    """The ``warpweft.axis.<name>`` attributes of a span or metric point, prefix stripped.
+
+    ``carrier`` is anything with an ``attributes`` mapping (a ReadableSpan or a
+    metric data point). Returns ``{axis_name: value}``.
+    """
+    attrs = dict(getattr(carrier, "attributes", None) or {})
+    prefix = conv.AXIS_ATTR_PREFIX
+    return {key[len(prefix) :]: value for key, value in attrs.items() if key.startswith(prefix)}

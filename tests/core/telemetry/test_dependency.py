@@ -7,13 +7,14 @@ policy links. In-memory OTel providers per test; globals untouched.
 
 from typing import Any
 
+from _support.axes import context_axes
 from _support.containers import registry_of
-from _support.otel import by_name, metering, points_by_operation, read, tracing
+from _support.otel import axis_attrs_of, by_name, metering, points_by_operation, read, tracing
 from opentelemetry.trace import StatusCode
 import pytest
 
-from warpweft.core.axes import GLOBAL_SCOPE
-from warpweft.core.component import AComponent, EmptySettings, invocable
+from warpweft.core.axes import GLOBAL_SCOPE, ScopeSpec
+from warpweft.core.component import AComponent, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Container, Registry
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import PermanentError, TransientError
@@ -307,3 +308,57 @@ async def test_guarded_invocation_of_the_dependency_is_not_doubled() -> None:
     await container.stop()
 
     assert len(by_name(exporter.get_finished_spans(), "dep.fetch")) == 1
+
+
+# --- dependency-call scope attribution ---------------------------------------
+
+
+async def test_dependency_span_carries_the_deps_slice_not_the_callers() -> None:
+    tracer_provider, exporter = tracing()
+    axes, handles = context_axes("tenant", "region")
+
+    class RegionDep(AComponent[EmptySettings, None, str]):
+        name = "region-dep"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("region",))
+
+        @invocable
+        async def where(self) -> str:
+            return "x"
+
+    class TenantCaller(AComponent[EmptySettings, None, str]):
+        name = "tenant-caller"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+        dependencies = ("region-dep",)
+
+        @invocable
+        async def ask(self) -> str:
+            return await self.dependency("region-dep").where()
+
+    container = Container.build(
+        registry_of(RegionDep, TenantCaller),
+        {"region-dep": {}, "tenant-caller": {}},
+        axes=axes,
+        tracer_provider=tracer_provider,
+    )
+    await container.start()
+    with handles["tenant"].use("acme"), handles["region"].use("eu"):
+        await container.invoke("tenant-caller", "ask")
+    await container.stop()
+
+    (parent,) = by_name(exporter.get_finished_spans(), "tenant-caller.ask")
+    (child,) = by_name(exporter.get_finished_spans(), "region-dep.where")
+    assert axis_attrs_of(parent) == {"tenant": "acme"}  # caller's own slice
+    assert axis_attrs_of(child) == {"region": "eu"}  # the dependency's own slice, not the caller's
+
+
+async def test_process_dep_span_carries_component_scope_key() -> None:
+    tracer_provider, exporter = tracing()
+    container = Container.build(fresh_registry(), {"dep": {}, "upper": {}}, tracer_provider=tracer_provider)
+    await container.start()
+    await container.invoke("upper", "run", tag="x")
+    await container.stop()
+
+    (dep_span,) = by_name(exporter.get_finished_spans(), "dep.fetch")
+    assert axis_attrs_of(dep_span) == {"component": "dep"}  # process dep is sliced by its component key
