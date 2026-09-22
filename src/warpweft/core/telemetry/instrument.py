@@ -49,6 +49,22 @@ logger = logging.getLogger(__name__)
 SpanEnricher = Callable[[trace.Span, InvocationContext, Outcome[Any] | None, BaseException | None], None]
 
 
+def _enrich(
+    span_enricher: SpanEnricher | None,
+    span: trace.Span,
+    ctx: InvocationContext,
+    outcome: Outcome[Any] | None,
+    exc: BaseException | None,
+) -> None:
+    """Run the host enricher, swallowing its failures so it can never break a call."""
+    if span_enricher is None:
+        return
+    try:
+        span_enricher(span, ctx, outcome, exc)
+    except Exception:  # enrichment must never break the call
+        logger.debug("span_enricher raised", exc_info=True)
+
+
 @dataclass(frozen=True)
 class TelemetryConfig:
     """Knobs of the wrapper. Collection itself is not one of them.
@@ -175,11 +191,6 @@ def instrument(
                 elapsed = resolved_clock.monotonic() - started
                 error_class = error_classifier.classify(exc).value
                 span.set_attribute(conv.ATTR_ERROR_CLASS, error_class)
-                if span_enricher is not None:
-                    try:
-                        span_enricher(span, ctx, None, exc)
-                    except Exception:  # enrichment must never break the call
-                        logger.debug("span_enricher raised on the error path", exc_info=True)
                 calls.add(
                     1,
                     {
@@ -190,6 +201,7 @@ def instrument(
                     },
                 )
                 duration.record(elapsed, {**operation_attr, conv.ATTR_STATUS: conv.STATUS_ERROR, **axes_allowed})
+                _enrich(span_enricher, span, ctx, None, exc)
                 raise
             else:
                 elapsed = resolved_clock.monotonic() - started
@@ -212,11 +224,7 @@ def instrument(
                 duration.record(elapsed, {**operation_attr, conv.ATTR_STATUS: conv.STATUS_OK, **axes_allowed})
                 if outcome.degraded:
                     degradations.add(1, {**operation_attr, **axes_all})
-                if span_enricher is not None:
-                    try:
-                        span_enricher(span, ctx, outcome, None)
-                    except Exception:  # enrichment must never break the call
-                        logger.debug("span_enricher raised on the success path", exc_info=True)
+                _enrich(span_enricher, span, ctx, outcome, None)
                 return outcome
             finally:
                 if previous is _MISSING:
