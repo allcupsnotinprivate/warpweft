@@ -7,6 +7,7 @@ policy links. In-memory OTel providers per test; globals untouched.
 
 from collections.abc import Mapping
 from typing import Any
+from unittest.mock import AsyncMock
 
 from _support.axes import context_axes
 from _support.containers import registry_of
@@ -501,6 +502,24 @@ async def test_boxed_binding_dependency_call_reports_caller_facing_fields() -> N
     await container.invoke("up", "run")
     await container.stop()
     assert seen["dep.search"] == {"field_a": 1, "field_b": "x"}  # flat, not {"query": <model>}
+
+
+async def test_reassigned_dependency_method_is_resolved_freshly() -> None:
+    # #46: the proxy must resolve the current attribute per call, so an invocable
+    # swapped on a long-lived (PROCESS) instance after wiring is honoured - the
+    # proxied path matches a bare-instance call, not the originally-captured method.
+    container = Container.build(fresh_registry(), {"dep": {}, "upper": {}})
+    await container.start()
+
+    assert (await container.invoke("upper", "run", tag="a")).value == "data:a"  # builds+caches the wrapper
+
+    dep = await container.get(Dep)
+    dep.fetch = AsyncMock(return_value="mocked")  # reassign after wiring
+
+    outcome = await container.invoke("upper", "run", tag="b")
+    await container.stop()
+    assert outcome.value == "mocked"  # the proxied call reached the swapped-in mock
+    dep.fetch.assert_awaited_once_with("b")
 
 
 @pytest.mark.characterization
