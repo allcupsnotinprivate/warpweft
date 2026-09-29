@@ -352,6 +352,7 @@ class Container:
         if method not in reg.descriptor.invocables:
             raise ConfigurationError(f"component '{component}' has no invocable '{method}'")
 
+        scoped_store: InMemoryStateStore | None = None
         if reg.descriptor.lifetime is Lifetime.PROCESS:
             instance = self._process.get(component)
             if instance is None:
@@ -360,6 +361,7 @@ class Container:
             scope_key: ScopeKey = (("component", component),)
         else:
             instance, scope_key = await self._scoped_instance(component)
+            scoped_store = self._scoped_stores[component]
             chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
 
         ctx = InvocationContext(
@@ -371,12 +373,18 @@ class Container:
             clock=self._clock,
         )
         endpoint = instance.endpoint() or instance.identity.uid
+        # Pin the scoped instance before the first checkpoint: an LRU eviction
+        # triggered by another tenant must not stop it while this call runs on it.
+        if scoped_store is not None:
+            scoped_store.acquire(instance)
         self._active_calls += 1
         try:
             with use_endpoint(endpoint), use_context(ctx):
                 return await chain(ctx)
         finally:
             self._active_calls -= 1
+            if scoped_store is not None:
+                await scoped_store.release(instance)
 
     async def _scoped_instance(self, component: str) -> tuple[AComponent[Any, Any, Any], ScopeKey]:
         reg = self._registrations[component]

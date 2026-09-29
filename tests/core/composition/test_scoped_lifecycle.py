@@ -99,11 +99,9 @@ async def test_invoke_after_stop_reports_not_started(container: Make) -> None:
         await c.invoke("rec", "whoami")
 
 
-@pytest.mark.characterization
-async def test_lru_eviction_stops_an_in_flight_instance(container: Make) -> None:
-    # CHARACTERIZATION: the scoped store's LRU stops an evicted instance even
-    # while a call is still running on it (the store lock does not cover the
-    # in-flight call). The parked call nonetheless completes.
+async def test_lru_eviction_defers_stopping_an_in_flight_instance(container: Make) -> None:
+    # An LRU eviction of a slice with a live call defers its stop() until the
+    # parked call finishes, so a call never runs on a stopped instance.
     axes, handles = context_axes("tenant")
     stopped: list[str] = []
     gate = anyio.Event()
@@ -136,8 +134,9 @@ async def test_lru_eviction_stops_an_in_flight_instance(container: Make) -> None
         async with anyio.create_task_group() as tg:
             tg.start_soon(call, "acme")
             await anyio.sleep(0.02)  # acme now parked in go()
-            tg.start_soon(call, "globex")  # evicts acme (max_entries=1) and stops it
+            tg.start_soon(call, "globex")  # evicts acme (max_entries=1) but must not stop it yet
             await anyio.sleep(0.02)
-            assert stopped == ["acme"]  # acme was stopped while still running
+            assert stopped == []  # acme is still running, so its stop() is deferred
             gate.set()
-        assert result["acme"] == "acme"  # the parked call completed anyway
+        assert result["acme"] == "acme"  # the parked call completed on a live instance
+        assert stopped == ["acme"]  # and acme was stopped once its call released
