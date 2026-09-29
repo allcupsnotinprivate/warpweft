@@ -470,6 +470,24 @@ class Container:
         except KeyError:
             raise ConfigurationError(f"component '{component}' is not configured") from None
 
+    def _check_introspection_scope(self, reg: _Registration, scope_key: ScopeKey) -> None:
+        """Reject introspecting a PROCESS component under a per-slice scope key.
+
+        A process component's chain and config are built once under
+        ``GLOBAL_SCOPE``; its invocations carry ``(("component", name),)`` only
+        for link-state slicing, never for config. Assembling under any non-global
+        key would consult the resolver at that key and report a slice override
+        that never reaches the running component - a silent no-op. Only a
+        ``GLOBAL_SCOPE``-keyed override applies, so anything else is rejected
+        loudly rather than misreported.
+        """
+        if reg.descriptor.lifetime is Lifetime.PROCESS and scope_key != GLOBAL_SCOPE:
+            raise ConfigurationError(
+                f"process component '{reg.name}' has no per-slice config: it runs under GLOBAL_SCOPE, "
+                f"so a slice override keyed by {scope_key!r} would be silently ignored. "
+                "Key the override by GLOBAL_SCOPE instead."
+            )
+
     def _assemble(self, name: str, scope_key: ScopeKey) -> BaseModel:
         """Merge the four config layers for an instance and cache the result."""
         cached = self._config_cache.get((name, scope_key))
@@ -601,6 +619,7 @@ class Container:
         reg = self._registration(component)
         if method not in reg.descriptor.invocables:
             raise ConfigurationError(f"component '{component}' has no invocable '{method}'")
+        self._check_introspection_scope(reg, scope_key)
         config = self._assemble(component, scope_key)
         spec = reg.descriptor.invocables[method]
         chain = tuple(link for link, _ in active_links(config, spec.policy))
@@ -609,7 +628,7 @@ class Container:
 
     def resolved_settings(self, component: str, *, scope_key: ScopeKey = GLOBAL_SCOPE) -> Mapping[str, Any]:
         """The fully resolved config of an instance as a plain mapping."""
-        self._registration(component)
+        self._check_introspection_scope(self._registration(component), scope_key)
         return self._assemble(component, scope_key).model_dump()
 
     def config_json(self, component: str, *, scope_key: ScopeKey = GLOBAL_SCOPE) -> dict[str, Any]:
@@ -619,7 +638,7 @@ class Container:
         ``**********`` and enums/dates become primitives - safe to print or
         serialize (unlike `resolved_settings`, which keeps live objects).
         """
-        self._registration(component)
+        self._check_introspection_scope(self._registration(component), scope_key)
         return self._assemble(component, scope_key).model_dump(mode="json")
 
     def snapshot(self) -> RuntimeSnapshot:

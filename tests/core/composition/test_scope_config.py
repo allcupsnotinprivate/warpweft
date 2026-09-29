@@ -19,7 +19,7 @@ from warpweft.core.axes import GLOBAL_SCOPE, ScopeKey, ScopeSpec
 from warpweft.core.component import AComponent, Lifetime, invocable
 from warpweft.core.composition import Container, DictSettingsResolver
 from warpweft.core.composition.config import SOURCE_SLICE
-from warpweft.core.errors import TransientError
+from warpweft.core.errors import ConfigurationError, TransientError
 
 pytestmark = pytest.mark.anyio
 
@@ -69,17 +69,19 @@ async def test_slice_override_provenance_is_slice(container: Make) -> None:
         assert explanation.provenance["prefix"] == SOURCE_SLICE  # first positive coverage of the slice source
 
 
-@pytest.mark.characterization
-async def test_process_component_slice_override_is_silently_ignored(container: Make) -> None:
-    # CHARACTERIZATION: a process chain is built under GLOBAL_SCOPE, but invoke
-    # carries scope_key=(("component", name),). A slice override keyed by that
-    # component tuple never reaches the running process component, even though
-    # resolved_settings(scope_key=that_key) would report it.
+async def test_process_component_rejects_per_slice_introspection(container: Make) -> None:
+    # A process chain is built under GLOBAL_SCOPE; a slice override keyed by the
+    # per-invoke component tuple can never reach it. Rather than assemble under
+    # that key and misreport an override with no runtime effect, introspecting a
+    # process component under a non-global scope_key is rejected loudly.
     component_key = (("component", "proc-echo"),)
     resolver = DictSettingsResolver({("proc-echo", component_key): {"prefix": "C:"}})
     async with container(ProcEcho, config={"proc-echo": {"prefix": "D:"}}, resolver=resolver) as c:
-        assert (await c.invoke("proc-echo", "echo", text="x")).value == "D:x"  # override ignored at runtime
-        assert c.resolved_settings("proc-echo", scope_key=component_key)["prefix"] == "C:"  # yet assemble sees it
+        assert (await c.invoke("proc-echo", "echo", text="x")).value == "D:x"  # deployment default runs
+        with pytest.raises(ConfigurationError, match="no per-slice config"):
+            c.resolved_settings("proc-echo", scope_key=component_key)  # no longer silently reported
+        with pytest.raises(ConfigurationError, match="no per-slice config"):
+            c.explain("proc-echo", "echo", scope_key=component_key)
 
 
 async def test_global_scope_override_applies_to_process_component(container: Make) -> None:
