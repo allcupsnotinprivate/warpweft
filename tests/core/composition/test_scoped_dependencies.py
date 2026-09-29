@@ -1,10 +1,11 @@
 """Cross-mode dependencies: a scoped caller reaching scoped / process deps.
 
 A scoped dependency slices by its OWN scope spec, independent of the caller's.
-Because a scoped caller binds its dependencies once (in the store factory), the
-dependency set is snapshotted at the caller's creation - a later axis change is
-not reflected on the already-cached caller. Both facts are pinned here; the
-snapshot one as a characterization test.
+Because a scoped caller resolves and binds its dependencies once - inside the
+store factory, which now runs only on a cache miss - the dependency set is
+snapshotted at the caller's creation: a later axis change is not reflected on
+the already-cached caller, and re-invoking it does not spin up unused dependency
+slices. Both facts are pinned here.
 """
 
 from collections.abc import Callable
@@ -16,6 +17,7 @@ import pytest
 from warpweft.core.axes import ScopeSpec
 from warpweft.core.component import AComponent, Criticality, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Container
+from warpweft.core.errors import ComponentUnavailable
 from warpweft.runtime.tenancy import AxisHandle
 
 pytestmark = pytest.mark.anyio
@@ -64,9 +66,8 @@ async def test_scoped_dep_with_different_axis_slices_by_its_own_spec(container: 
         assert c.snapshot().live_slices["region-dep"] == ((("region", "eu"),),)
 
 
-@pytest.mark.characterization
 async def test_scoped_dep_is_snapshotted_at_caller_creation(container: Make) -> None:
-    # CHARACTERIZATION: a scoped caller binds its deps once, in the store factory.
+    # A scoped caller resolves and binds its deps once, in the store factory.
     # After the caller is cached, changing the dependency's axis does NOT rebind
     # it - the cached caller keeps calling the dep slice it was created with.
     axes, handles = context_axes("tenant", "region")
@@ -78,11 +79,11 @@ async def test_scoped_dep_is_snapshotted_at_caller_creation(container: Make) -> 
             assert (await c.invoke("tenant-caller", "ask")).value == "eu"  # cached caller still calls the eu dep
 
 
-@pytest.mark.characterization
-async def test_degraded_optional_process_dep_raises_keyerror_at_use(container: Make) -> None:
-    # CHARACTERIZATION: a degraded (start-failed) OPTIONAL process dependency is
-    # silently omitted from the dependent's dep map; the dependent starts fine but
-    # self.dependency(name) raises KeyError at call time (not ComponentUnavailable).
+async def test_degraded_optional_process_dep_raises_component_unavailable_at_use(container: Make) -> None:
+    # A degraded (start-failed) OPTIONAL process dependency is silently omitted
+    # from the dependent's dep map; the dependent starts fine and self.dependency
+    # (name) raises ComponentUnavailable at call time - the same domain error the
+    # invoke path raises for a degraded component - not a bare KeyError.
     axes, handles = context_axes("tenant")
 
     class OptProc(AComponent[EmptySettings, None, str]):
@@ -108,22 +109,20 @@ async def test_degraded_optional_process_dep_raises_keyerror_at_use(container: M
 
     async with container(OptProc, Caller, config={"opt-proc": {}, "caller": {}}, axes=axes) as c:
         assert c.is_degraded("opt-proc") is True
-        with handles["tenant"].use("acme"), pytest.raises(KeyError, match="opt-proc"):
+        with handles["tenant"].use("acme"), pytest.raises(ComponentUnavailable, match="opt-proc"):
             await c.invoke("caller", "use_dep")
 
 
-@pytest.mark.characterization
-async def test_dep_re_resolution_creates_unused_slices(container: Make) -> None:
-    # CHARACTERIZATION: _resolve_dependencies runs on every invoke of a scoped
-    # component, so invoking a cached caller under a new dep axis creates (and
-    # starts) a fresh dep slice the caller never uses.
+async def test_dep_re_resolution_does_not_create_unused_slices(container: Make) -> None:
+    # Dependencies are resolved inside the store factory, which runs only on a
+    # cache miss. Invoking an already-cached caller under a new dep axis reuses
+    # the caller without re-resolving - so no fresh, unused dep slice is created.
     axes, handles = context_axes("tenant", "region")
     region_dep, caller = _region_dep_and_caller(handles["region"])
     async with container(region_dep, caller, config={"region-dep": {}, "tenant-caller": {}}, axes=axes) as c:
         with handles["tenant"].use("acme"), handles["region"].use("eu"):
             await c.invoke("tenant-caller", "ask")  # creates the eu dep the caller keeps
         with handles["tenant"].use("acme"), handles["region"].use("us"):
-            await c.invoke("tenant-caller", "ask")  # re-resolves deps -> creates a us dep slice
+            await c.invoke("tenant-caller", "ask")  # cached caller: no re-resolution
         slices = set(c.snapshot().live_slices["region-dep"])
-        assert (("region", "eu"),) in slices  # the one the cached caller actually uses
-        assert (("region", "us"),) in slices  # created as a side effect, unused by acme
+        assert slices == {(("region", "eu"),)}  # only the slice the cached caller uses

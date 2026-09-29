@@ -381,16 +381,19 @@ class Container:
     async def _scoped_instance(self, component: str) -> tuple[AComponent[Any, Any, Any], ScopeKey]:
         reg = self._registrations[component]
         scope_key = self._axes.resolve(reg.descriptor.scope)
-        deps = await self._resolve_dependencies(reg.descriptor.dependencies)
         store = self._scoped_stores[component]
 
-        def factory() -> AComponent[Any, Any, Any]:
+        async def factory() -> AComponent[Any, Any, Any]:
+            # Resolve dependencies inside the factory so it happens only when this
+            # scope key is actually created: a cached caller neither rebinds its
+            # deps nor spins up unused dependency slices on a later axis change.
+            deps = await self._resolve_dependencies(reg.descriptor.dependencies)
             instance, _ = self._instantiate(component, scope_key)
             instance.bind_dependencies(deps)
             instance.bind_invoker(self._invoker_for(component))
             return instance
 
-        instance = await store.get_or_create(scope_key, factory)
+        instance: AComponent[Any, Any, Any] = await store.get_or_create(scope_key, factory)
         return instance, scope_key
 
     async def _resolve_dependencies(self, names: tuple[str, ...]) -> dict[str, AComponent[Any, Any, Any]]:

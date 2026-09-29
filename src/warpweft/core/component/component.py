@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from warpweft.core.axes import EMPTY_SCOPE, ScopeSpec
 from warpweft.core.context import InvocationContext
+from warpweft.core.errors import ComponentUnavailable
 from warpweft.core.outcome import Outcome
 from warpweft.core.telemetry.component import NOOP_TELEMETRY, ComponentTelemetry, constructing_telemetry
 from warpweft.core.unit import Identity
@@ -141,8 +142,23 @@ class AComponent(Generic[TSettings, TIn, TOut]):
                 setattr(self, attr, instance)
 
     def dependency(self, name: str) -> "AComponent[Any, Any, Any]":
-        """Return a declared dependency's instance."""
-        return self._deps[name]
+        """Return a declared dependency's instance.
+
+        A dependency that was declared but is absent from the bound map is an
+        OPTIONAL component that failed to start (degraded) and was silently
+        omitted. Surface that as ``ComponentUnavailable`` - the same domain
+        error the invoke path raises for a degraded component - rather than a
+        bare ``KeyError``. An undeclared name is a programming error and still
+        raises ``KeyError``.
+        """
+        try:
+            return self._deps[name]
+        except KeyError:
+            if name in component_dependencies(type(self)):
+                raise ComponentUnavailable(
+                    f"dependency '{name}' of '{self.name}' is unavailable (degraded at start)"
+                ) from None
+            raise
 
     def bind_invoker(self, invoke: Callable[..., Awaitable[Outcome[Any]]]) -> None:
         """Receive a bound invoker for this instance (called by the container).
