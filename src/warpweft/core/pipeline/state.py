@@ -4,7 +4,8 @@ Link instances live here, one per scope key. The store owns their
 lifecycle tail: whatever it evicts, it stops.
 """
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+import inspect
 from typing import Protocol, TypeVar, cast
 
 import anyio
@@ -14,11 +15,16 @@ from warpweft.core.unit import Startable, Stoppable
 
 T = TypeVar("T")
 
+#: A factory may be synchronous or return an awaitable. An async factory lets a
+#: caller defer expensive work (e.g. resolving a component's dependencies) until
+#: a cache miss actually requires construction, all under the store's lock.
+Factory = Callable[[], T | Awaitable[T]]
+
 
 class StateStore(Protocol):
     """Keyed storage of link instances with bounded cardinality."""
 
-    async def get_or_create(self, key: ScopeKey, factory: Callable[[], T]) -> T:
+    async def get_or_create(self, key: ScopeKey, factory: Factory[T]) -> T:
         """Return the instance for ``key``, creating it exactly once."""
         ...
 
@@ -63,7 +69,7 @@ class InMemoryStateStore:
         """Snapshot of the live keys, most-recently-used last."""
         return list(self._entries)
 
-    async def get_or_create(self, key: ScopeKey, factory: Callable[[], T]) -> T:
+    async def get_or_create(self, key: ScopeKey, factory: Factory[T]) -> T:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("state store is closed")
@@ -72,7 +78,10 @@ class InMemoryStateStore:
                 self._entries[key] = self._entries.pop(key)
                 return cast(T, self._entries[key])
 
-            instance = factory()
+            # Only ever runs on a cache miss, under the lock, so a sync-or-async
+            # factory's work (dependency resolution) is never wasted on a hit.
+            created = factory()
+            instance = await created if inspect.isawaitable(created) else created
             if isinstance(instance, Startable):
                 await instance.start()
             self._entries[key] = instance
