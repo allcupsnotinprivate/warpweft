@@ -55,7 +55,7 @@ from .config import (
     SettingsResolver,
     assemble_config,
 )
-from .endpoint import endpoint_axis, use_endpoint
+from .endpoint import default_endpoint, endpoint_axis, use_endpoint
 from .graph import DependencyGraph, GraphNode
 from .health import Readiness, aggregate_readiness
 from .introspection import (
@@ -372,7 +372,7 @@ class Container:
             scope_key=scope_key,
             clock=self._clock,
         )
-        endpoint = instance.endpoint() or instance.identity.uid
+        endpoint = instance.endpoint() or default_endpoint(instance.identity.uid, scope_key)
         # Pin the scoped instance before the first checkpoint: an LRU eviction
         # triggered by another tenant must not stop it while this call runs on it.
         if scoped_store is not None:

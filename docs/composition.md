@@ -136,6 +136,12 @@ breaker, concurrency's outer limit) is shared by instances on the same endpoint
 and separated across different ones - with no component declaring it. Other axes
 (e.g. a tenant axis for scoped components) are registered by the application.
 
+When a component declares no `endpoint()`, the fallback folds the instance's
+slice into the endpoint, so a scoped component isolates its breaker/concurrency
+per slice by default (as its cache already is) - one tenant tripping the breaker
+never opens it for another. Return a slice-independent `endpoint()` (e.g. a
+shared host) to deliberately share that state across slices.
+
 ## Layered configuration
 
 A component's config is merged from four sources, each overriding the previous

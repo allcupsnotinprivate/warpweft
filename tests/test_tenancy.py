@@ -3,9 +3,9 @@
 Cross-cutting scenarios spanning the container, the axis machinery and the
 policy chain. Cache state is isolated per tenant automatically (the slice key is
 part of the cache key); breaker/concurrency state is sliced by the ``endpoint``
-axis, so a scoped component only gets a per-tenant breaker if its ``endpoint()``
-varies by tenant - otherwise the breaker is shared across tenants (pinned as a
-characterization).
+axis, whose default folds the instance's slice into the fallback - so a scoped
+component isolates its breaker per tenant by default. Declaring an explicit
+``endpoint()`` overrides that and can deliberately share state across slices.
 """
 
 from collections.abc import Callable
@@ -113,17 +113,44 @@ async def test_breaker_isolated_per_tenant_when_endpoint_varies(container: Make)
             await c.invoke("svc", "go")  # globex's own breaker is still closed
 
 
-@pytest.mark.characterization
-async def test_breaker_is_shared_across_tenants_by_default(container: Make) -> None:
-    # CHARACTERIZATION: without a per-tenant endpoint(), the breaker slices by
-    # endpoint=identity.uid, which is per (name, version) - the SAME for every
-    # tenant slice. One tenant tripping the breaker opens it for all tenants.
+async def test_breaker_isolated_per_tenant_by_default(container: Make) -> None:
+    # Without an explicit endpoint(), the breaker slices by a default endpoint
+    # that folds in the instance's slice, so it is per tenant by default: one
+    # tenant tripping the breaker leaves every other tenant's breaker closed.
     axes, handles = context_axes("tenant")
 
     class Svc(AComponent[EmptySettings, None, str]):
         name = "svc"
         lifetime = Lifetime.SCOPED
         scope = ScopeSpec(("tenant",))
+
+        @invocable
+        async def go(self) -> str:
+            raise TransientError("down")
+
+    async with container(Svc, config={"svc": _BREAKER}, axes=axes) as c:
+        with handles["tenant"].use("acme"):
+            with pytest.raises(TransientError):
+                await c.invoke("svc", "go")  # trips acme's breaker
+            with pytest.raises(CircuitOpen):
+                await c.invoke("svc", "go")  # acme is open
+        with handles["tenant"].use("globex"), pytest.raises(TransientError):
+            await c.invoke("svc", "go")  # globex's own breaker is still closed
+
+
+async def test_breaker_shared_across_tenants_when_endpoint_is_constant(container: Make) -> None:
+    # An explicit, tenant-independent endpoint() opts back into shared link
+    # state: every tenant slice resolves to the same endpoint, so one tenant
+    # tripping the breaker opens it for all of them.
+    axes, handles = context_axes("tenant")
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+
+        def endpoint(self) -> str | None:
+            return "shared-host"  # constant => one breaker across tenants
 
         @invocable
         async def go(self) -> str:
