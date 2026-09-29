@@ -1,9 +1,9 @@
 """Scoped-component lifecycle: creation, start-failure, stop, and eviction.
 
-Where scoped behavior diverges from process behavior (a scoped instance starts
-lazily inside the store, with no init_timeout and no criticality handling), the
-divergence is pinned with a ``characterization`` test that passes today and will
-fail loudly when the product is fixed.
+A scoped instance starts lazily inside the store, but that lazy start gets the
+same treatment a process start does: it is bounded by ``init_timeout`` and its
+failure is routed by criticality (a REQUIRED slice surfaces ``StartupError``, an
+OPTIONAL one degrades the component and reports ``ComponentUnavailable``).
 """
 
 from collections.abc import Callable
@@ -17,23 +17,22 @@ import pytest
 from warpweft.core.axes import ScopeSpec
 from warpweft.core.component import AComponent, Criticality, EmptySettings, Lifetime, invocable
 from warpweft.core.composition import Container
-from warpweft.core.errors import ConfigurationError
+from warpweft.core.errors import ComponentUnavailable, ConfigurationError, StartupError
 
 pytestmark = pytest.mark.anyio
 
 Make = Callable[..., AbstractAsyncContextManager[Container]]
 
 
-@pytest.mark.characterization
-async def test_scoped_start_failure_propagates_raw(container: Make) -> None:
-    # CHARACTERIZATION: a scoped instance whose start() raises escapes invoke as
-    # that raw exception - not StartupError/ComponentUnavailable (no criticality
-    # handling on the lazy scoped-start path, unlike process components).
+async def test_scoped_start_failure_raises_startup_error(container: Make) -> None:
+    # A REQUIRED scoped instance whose start() raises surfaces StartupError (with
+    # the raw failure as __cause__), like a process component - not the raw error.
     axes, handles = context_axes("tenant")
     failing = failing_start("f", exc=RuntimeError("boom"))
     async with container(failing, config={"f": {}}, axes=axes) as c:
-        with handles["tenant"].use("acme"), pytest.raises(RuntimeError, match="boom"):
+        with handles["tenant"].use("acme"), pytest.raises(StartupError, match="failed to start") as info:
             await c.invoke("f", "go")
+        assert isinstance(info.value.__cause__, RuntimeError) and str(info.value.__cause__) == "boom"
 
 
 async def test_scoped_start_failure_is_not_cached(container: Make) -> None:
@@ -50,34 +49,33 @@ async def test_scoped_start_failure_is_not_cached(container: Make) -> None:
 
     async with container(failing, config={"f": {}}, axes=axes) as c:
         for _ in range(2):
-            with handles["tenant"].use("acme"), pytest.raises(RuntimeError):
+            with handles["tenant"].use("acme"), pytest.raises(StartupError):
                 await c.invoke("f", "go")
             assert c.snapshot().live_slices.get("f") == ()  # nothing cached between attempts
         assert len(starts) == 2  # each invoke re-attempts creation
 
 
-@pytest.mark.characterization
-async def test_scoped_start_ignores_init_timeout(container: Make) -> None:
-    # CHARACTERIZATION: init_timeout bounds only process startup; a hanging scoped
-    # start is not cut - only an outer cancellation stops it.
+async def test_scoped_start_honors_init_timeout(container: Make) -> None:
+    # init_timeout bounds the lazy scoped start too: a hanging start is cut at the
+    # deadline and surfaces StartupError, rather than blocking until an outer
+    # cancellation (the 0.15s guard scope) fires.
     axes, handles = context_axes("tenant")
     hanging = hanging_start("h")
     async with container(hanging, config={"h": {}}, axes=axes, init_timeout=0.01) as c:
-        with anyio.move_on_after(0.15) as scope, handles["tenant"].use("acme"):
+        with anyio.move_on_after(0.15) as scope, handles["tenant"].use("acme"), pytest.raises(StartupError):
             await c.invoke("h", "go")
-        assert scope.cancelled_caught  # the 0.01s init_timeout did NOT fire
+        assert not scope.cancelled_caught  # the 0.01s init_timeout fired first
 
 
-@pytest.mark.characterization
-async def test_scoped_start_failure_ignores_optional_criticality(container: Make) -> None:
-    # CHARACTERIZATION: an OPTIONAL scoped component's start failure still raises
-    # raw and never marks the component degraded (no _degraded tracking for scoped).
+async def test_scoped_start_failure_degrades_optional(container: Make) -> None:
+    # An OPTIONAL scoped component's start failure degrades the component (like a
+    # process one) and reports ComponentUnavailable instead of raising raw.
     axes, handles = context_axes("tenant")
     failing = failing_start("f", exc=RuntimeError("nope"), criticality=Criticality.OPTIONAL)
     async with container(failing, config={"f": {}}, axes=axes) as c:
-        with handles["tenant"].use("acme"), pytest.raises(RuntimeError, match="nope"):
+        with handles["tenant"].use("acme"), pytest.raises(ComponentUnavailable):
             await c.invoke("f", "go")
-        assert c.is_degraded("f") is False
+        assert c.is_degraded("f") is True
 
 
 async def test_container_stop_stops_all_live_scoped_slices(container: Make) -> None:
@@ -101,11 +99,9 @@ async def test_invoke_after_stop_reports_not_started(container: Make) -> None:
         await c.invoke("rec", "whoami")
 
 
-@pytest.mark.characterization
-async def test_lru_eviction_stops_an_in_flight_instance(container: Make) -> None:
-    # CHARACTERIZATION: the scoped store's LRU stops an evicted instance even
-    # while a call is still running on it (the store lock does not cover the
-    # in-flight call). The parked call nonetheless completes.
+async def test_lru_eviction_defers_stopping_an_in_flight_instance(container: Make) -> None:
+    # An LRU eviction of a slice with a live call defers its stop() until the
+    # parked call finishes, so a call never runs on a stopped instance.
     axes, handles = context_axes("tenant")
     stopped: list[str] = []
     gate = anyio.Event()
@@ -138,8 +134,9 @@ async def test_lru_eviction_stops_an_in_flight_instance(container: Make) -> None
         async with anyio.create_task_group() as tg:
             tg.start_soon(call, "acme")
             await anyio.sleep(0.02)  # acme now parked in go()
-            tg.start_soon(call, "globex")  # evicts acme (max_entries=1) and stops it
+            tg.start_soon(call, "globex")  # evicts acme (max_entries=1) but must not stop it yet
             await anyio.sleep(0.02)
-            assert stopped == ["acme"]  # acme was stopped while still running
+            assert stopped == []  # acme is still running, so its stop() is deferred
             gate.set()
-        assert result["acme"] == "acme"  # the parked call completed anyway
+        assert result["acme"] == "acme"  # the parked call completed on a live instance
+        assert stopped == ["acme"]  # and acme was stopped once its call released

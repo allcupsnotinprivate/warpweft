@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from warpweft.core.axes import GLOBAL_SCOPE, AxisRegistry, ScopeKey
 from warpweft.core.clock import Clock, SystemClock
-from warpweft.core.component import AComponent, Criticality, Descriptor, HealthStatus, Lifetime
+from warpweft.core.component import AComponent, Criticality, Descriptor, Health, HealthStatus, Lifetime
 from warpweft.core.component.settings import POLICY_FIELD
 from warpweft.core.context import InvocationContext, current_correlation_id, use_context
 from warpweft.core.errors import (
@@ -352,6 +352,7 @@ class Container:
         if method not in reg.descriptor.invocables:
             raise ConfigurationError(f"component '{component}' has no invocable '{method}'")
 
+        scoped_store: InMemoryStateStore | None = None
         if reg.descriptor.lifetime is Lifetime.PROCESS:
             instance = self._process.get(component)
             if instance is None:
@@ -360,6 +361,7 @@ class Container:
             scope_key: ScopeKey = (("component", component),)
         else:
             instance, scope_key = await self._scoped_instance(component)
+            scoped_store = self._scoped_stores[component]
             chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
 
         ctx = InvocationContext(
@@ -371,12 +373,18 @@ class Container:
             clock=self._clock,
         )
         endpoint = instance.endpoint() or instance.identity.uid
+        # Pin the scoped instance before the first checkpoint: an LRU eviction
+        # triggered by another tenant must not stop it while this call runs on it.
+        if scoped_store is not None:
+            scoped_store.acquire(instance)
         self._active_calls += 1
         try:
             with use_endpoint(endpoint), use_context(ctx):
                 return await chain(ctx)
         finally:
             self._active_calls -= 1
+            if scoped_store is not None:
+                await scoped_store.release(instance)
 
     async def _scoped_instance(self, component: str) -> tuple[AComponent[Any, Any, Any], ScopeKey]:
         reg = self._registrations[component]
@@ -393,7 +401,26 @@ class Container:
             instance.bind_invoker(self._invoker_for(component))
             return instance
 
-        instance: AComponent[Any, Any, Any] = await store.get_or_create(scope_key, factory)
+        # The lazy scoped start (inside get_or_create) gets the same treatment a
+        # process start does: bounded by init_timeout, and its failure routed by
+        # criticality. A REQUIRED slice that fails or hangs surfaces StartupError;
+        # an OPTIONAL one degrades the component and reports ComponentUnavailable.
+        # A failed start is never cached (get_or_create publishes only on success),
+        # so a REQUIRED slice re-attempts on the next invoke.
+        try:
+            with anyio.fail_after(self._init_timeout):
+                instance: AComponent[Any, Any, Any] = await store.get_or_create(scope_key, factory)
+        except ConfigurationError:
+            # A misconfiguration (e.g. a slice-override contradiction surfaced at
+            # first use) is a deploy-time bug, not a degradable startup failure:
+            # it propagates raw regardless of criticality.
+            raise
+        except Exception as exc:
+            if reg.descriptor.criticality is Criticality.REQUIRED:
+                raise StartupError(f"scoped component '{component}' failed to start: {exc}") from exc
+            logger.warning("optional component %r degraded: failed to start: %s", component, exc)
+            self._degraded.add(component)
+            raise ComponentUnavailable(f"component '{component}' is degraded") from exc
         return instance, scope_key
 
     async def _resolve_dependencies(self, names: tuple[str, ...]) -> dict[str, AComponent[Any, Any, Any]]:
@@ -442,6 +469,24 @@ class Container:
             return self._registrations[component]
         except KeyError:
             raise ConfigurationError(f"component '{component}' is not configured") from None
+
+    def _check_introspection_scope(self, reg: _Registration, scope_key: ScopeKey) -> None:
+        """Reject introspecting a PROCESS component under a per-slice scope key.
+
+        A process component's chain and config are built once under
+        ``GLOBAL_SCOPE``; its invocations carry ``(("component", name),)`` only
+        for link-state slicing, never for config. Assembling under any non-global
+        key would consult the resolver at that key and report a slice override
+        that never reaches the running component - a silent no-op. Only a
+        ``GLOBAL_SCOPE``-keyed override applies, so anything else is rejected
+        loudly rather than misreported.
+        """
+        if reg.descriptor.lifetime is Lifetime.PROCESS and scope_key != GLOBAL_SCOPE:
+            raise ConfigurationError(
+                f"process component '{reg.name}' has no per-slice config: it runs under GLOBAL_SCOPE, "
+                f"so a slice override keyed by {scope_key!r} would be silently ignored. "
+                "Key the override by GLOBAL_SCOPE instead."
+            )
 
     def _assemble(self, name: str, scope_key: ScopeKey) -> BaseModel:
         """Merge the four config layers for an instance and cache the result."""
@@ -517,16 +562,39 @@ class Container:
 
     async def _component_status(self, name: str) -> HealthStatus:
         reg = self._registrations[name]
-        if reg.descriptor.lifetime is Lifetime.SCOPED:
-            return HealthStatus.ok()  # created on demand; nothing running to poll
         if name in self._degraded:
             return HealthStatus.degraded("failed to start")
+        if reg.descriptor.lifetime is Lifetime.SCOPED:
+            return await self._scoped_status(name)
         instance = self._process.get(name)
         if instance is None:
             return HealthStatus.unhealthy("not running")
+        return await self._poll_health(instance)
+
+    async def _scoped_status(self, name: str) -> HealthStatus:
+        """Readiness for a scoped component: aggregate its live slices' health.
+
+        A scoped component with no live slice reports ``ok`` (nothing running to
+        poll). Otherwise every live slice is polled and the worst verdict wins,
+        so an unhealthy tenant slice can move readiness - a degraded one is
+        surfaced but, if the component is OPTIONAL, does not break it.
+        """
+        store = self._scoped_stores.get(name)
+        instances = [cast("AComponent[Any, Any, Any]", i) for _, i in store.items()] if store else []
+        statuses = [await self._poll_health(instance) for instance in instances]
+        if not statuses:
+            return HealthStatus.ok()
+        if any(s.state is Health.UNHEALTHY for s in statuses):
+            return next(s for s in statuses if s.state is Health.UNHEALTHY)
+        if any(s.state is Health.DEGRADED for s in statuses):
+            return next(s for s in statuses if s.state is Health.DEGRADED)
+        return HealthStatus.ok()
+
+    async def _poll_health(self, instance: AComponent[Any, Any, Any]) -> HealthStatus:
+        """Poll one instance's ``health()`` under the health timeout (not the chain)."""
         try:
             with anyio.fail_after(self._health_timeout):
-                return await instance.health()  # via timeout only, not the full chain
+                return await instance.health()
         except Exception:
             return HealthStatus.unhealthy("health check failed")
 
@@ -574,6 +642,7 @@ class Container:
         reg = self._registration(component)
         if method not in reg.descriptor.invocables:
             raise ConfigurationError(f"component '{component}' has no invocable '{method}'")
+        self._check_introspection_scope(reg, scope_key)
         config = self._assemble(component, scope_key)
         spec = reg.descriptor.invocables[method]
         chain = tuple(link for link, _ in active_links(config, spec.policy))
@@ -582,7 +651,7 @@ class Container:
 
     def resolved_settings(self, component: str, *, scope_key: ScopeKey = GLOBAL_SCOPE) -> Mapping[str, Any]:
         """The fully resolved config of an instance as a plain mapping."""
-        self._registration(component)
+        self._check_introspection_scope(self._registration(component), scope_key)
         return self._assemble(component, scope_key).model_dump()
 
     def config_json(self, component: str, *, scope_key: ScopeKey = GLOBAL_SCOPE) -> dict[str, Any]:
@@ -592,7 +661,7 @@ class Container:
         ``**********`` and enums/dates become primitives - safe to print or
         serialize (unlike `resolved_settings`, which keeps live objects).
         """
-        self._registration(component)
+        self._check_introspection_scope(self._registration(component), scope_key)
         return self._assemble(component, scope_key).model_dump(mode="json")
 
     def snapshot(self) -> RuntimeSnapshot:

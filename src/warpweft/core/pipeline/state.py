@@ -28,6 +28,14 @@ class StateStore(Protocol):
         """Return the instance for ``key``, creating it exactly once."""
         ...
 
+    def acquire(self, instance: object) -> None:
+        """Pin ``instance`` so eviction defers its ``stop()`` until released."""
+        ...
+
+    async def release(self, instance: object) -> None:
+        """Drop one pin; stop the instance if it was evicted while pinned."""
+        ...
+
     async def evict(self, key: ScopeKey) -> None:
         """Drop the instance for ``key`` (stopping it if it is Stoppable)."""
         ...
@@ -48,6 +56,13 @@ class InMemoryStateStore:
     If the created object is Startable it is started before being published.
     On eviction (LRU overflow, explicit evict, close) Stoppable objects are
     stopped.
+
+    In-flight protection: a caller that is actively using an instance can pin it
+    with ``acquire``/``release``. An eviction (LRU overflow or explicit evict)
+    of a pinned instance drops it from the live set immediately but defers its
+    ``stop()`` until the last reference is released, so a call parked on a slice
+    never runs on a stopped object. ``close`` stops everything regardless (the
+    caller is expected to have drained in-flight work first).
     """
 
     def __init__(self, max_entries: int = 1000) -> None:
@@ -55,6 +70,12 @@ class InMemoryStateStore:
             raise ValueError("max_entries must be positive")
         self._max_entries = max_entries
         self._entries: dict[ScopeKey, object] = {}
+        #: Live pin counts, keyed by ``id(instance)``: how many callers are
+        #: currently using each instance (see ``acquire``/``release``).
+        self._refs: dict[int, int] = {}
+        #: Instances evicted while still pinned, keyed by ``id(instance)``. They
+        #: are already out of ``_entries``; ``stop()`` runs on final release.
+        self._pending_stop: dict[int, object] = {}
         self._lock = anyio.Lock()
         self._closed = False
 
@@ -88,24 +109,54 @@ class InMemoryStateStore:
 
             while len(self._entries) > self._max_entries:
                 oldest_key = next(iter(self._entries))
-                await self._stop(self._entries.pop(oldest_key))
+                await self._evict_instance(self._entries.pop(oldest_key))
             return instance
+
+    def acquire(self, instance: object) -> None:
+        """Pin ``instance`` against eviction-stop for the length of a call.
+
+        Synchronous on purpose: the caller pins the instance in the same step it
+        obtained it from ``get_or_create``, with no intervening checkpoint, so a
+        concurrent eviction can never stop it out from under an in-flight call.
+        """
+        self._refs[id(instance)] = self._refs.get(id(instance), 0) + 1
+
+    async def release(self, instance: object) -> None:
+        """Drop one pin; if it was the last and the instance was evicted, stop it."""
+        ident = id(instance)
+        count = self._refs.get(ident, 0) - 1
+        if count > 0:
+            self._refs[ident] = count
+            return
+        self._refs.pop(ident, None)
+        deferred = self._pending_stop.pop(ident, None)
+        if deferred is not None:
+            await self._stop(deferred)
 
     async def evict(self, key: ScopeKey) -> None:
         async with self._lock:
             instance = self._entries.pop(key, None)
-            if instance is not None:
-                await self._stop(instance)
+        if instance is not None:
+            await self._evict_instance(instance)
 
     async def close(self) -> None:
         async with self._lock:
             if self._closed:
                 return
             self._closed = True
-            instances = list(self._entries.values())
+            instances = [*self._entries.values(), *self._pending_stop.values()]
             self._entries.clear()
+            self._pending_stop.clear()
+            self._refs.clear()
             for instance in instances:
                 await self._stop(instance)
+
+    async def _evict_instance(self, instance: object) -> None:
+        """Stop an evicted instance now, or defer it if a call still pins it."""
+        if self._refs.get(id(instance), 0) > 0:
+            self._pending_stop[id(instance)] = instance  # busy: stop on final release
+            return
+        await self._stop(instance)
 
     @staticmethod
     async def _stop(instance: object) -> None:
