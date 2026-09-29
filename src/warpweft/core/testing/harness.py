@@ -14,7 +14,7 @@ from warpweft.core.component import AComponent, describe
 from warpweft.core.component.descriptor import BUILTIN_LINK_MODELS
 from warpweft.core.component.policy import EffectivePolicy
 from warpweft.core.component.settings import build_config_model
-from warpweft.core.composition.endpoint import endpoint_axis, use_endpoint
+from warpweft.core.composition.endpoint import default_endpoint, endpoint_axis, use_endpoint
 from warpweft.core.composition.wiring import (
     degradation_interceptor,
     link_settings,
@@ -102,7 +102,7 @@ async def drive(
     """
     spec = describe(type(component)).invocables[method]
     policy = dict((config or {}).get("policy", {}))
-    endpoint = component.endpoint() or component.identity.uid
+    endpoint = component.endpoint() or default_endpoint(component.identity.uid, scope_key)
     base = make_base(component, spec)
     return await _run(
         policy,

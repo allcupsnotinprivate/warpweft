@@ -12,10 +12,27 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from warpweft.core.axes import Axis
+from warpweft.core.axes import Axis, ScopeKey
 
 #: Name of the built-in endpoint axis.
 ENDPOINT_AXIS = "endpoint"
+
+
+def default_endpoint(uid: str, scope_key: ScopeKey) -> str:
+    """Fallback endpoint for an instance that declares no ``endpoint()``.
+
+    An instance's identity uid is per ``(name, version)`` - shared by every
+    slice of a scoped component. Using it bare would slice ``[endpoint]`` link
+    state (breaker, concurrency) by component, so one tenant tripping the
+    breaker would open it for all tenants. Folding the instance's slice into
+    the fallback isolates that state per slice by default (as cache already is);
+    an explicit ``endpoint()`` still wins and can deliberately share state.
+    """
+    if not scope_key:
+        return uid
+    slice_repr = ",".join(f"{axis}={value}" for axis, value in scope_key)
+    return f"{uid}[{slice_repr}]"
+
 
 _current_endpoint: ContextVar[str | None] = ContextVar("warpweft_current_endpoint", default=None)
 
