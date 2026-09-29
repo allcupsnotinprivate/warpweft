@@ -164,20 +164,24 @@ async def test_health_check_timeout_is_unhealthy() -> None:
     await container.stop()
 
 
-@pytest.mark.characterization
-async def test_readiness_ignores_an_unhealthy_live_scoped_instance() -> None:
-    # CHARACTERIZATION: a scoped component always reports HealthStatus.ok() in
-    # readiness ("created on demand; nothing running to poll") - even when a live
-    # slice's health() would return unhealthy, and that health() is never called.
+async def test_readiness_polls_an_unhealthy_live_scoped_instance() -> None:
+    # Readiness aggregates live scoped slices: once a slice exists, its health()
+    # is polled, so an unhealthy tenant slice moves readiness for a REQUIRED
+    # scoped component. A component with no live slice still reports ok.
     axes, handles = context_axes("tenant")
     polls: list[int] = []
     reporter = health_reporter("rep", healthy=lambda: False, on_check=lambda: polls.append(1))
     container = Container.build(registry_of(reporter), {"rep": {}}, axes=axes)
     await container.start()
+
+    assert (await container.readiness()).ready  # no live slice yet: nothing to poll, ready
+    assert polls == []
+
     with handles["tenant"].use("acme"):
         await container.invoke("rep", "go")  # a live, unhealthy scoped slice now exists
 
     result = await container.readiness()
-    assert result.ready  # readiness does not see the unhealthy scoped slice
-    assert polls == []  # the scoped instance's health() is never polled
+    assert not result.ready  # the unhealthy slice breaks readiness
+    assert result.components["rep"].state is Health.UNHEALTHY
+    assert polls  # the scoped instance's health() was polled
     await container.stop()

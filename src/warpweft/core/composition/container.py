@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from warpweft.core.axes import GLOBAL_SCOPE, AxisRegistry, ScopeKey
 from warpweft.core.clock import Clock, SystemClock
-from warpweft.core.component import AComponent, Criticality, Descriptor, HealthStatus, Lifetime
+from warpweft.core.component import AComponent, Criticality, Descriptor, Health, HealthStatus, Lifetime
 from warpweft.core.component.settings import POLICY_FIELD
 from warpweft.core.context import InvocationContext, current_correlation_id, use_context
 from warpweft.core.errors import (
@@ -562,16 +562,39 @@ class Container:
 
     async def _component_status(self, name: str) -> HealthStatus:
         reg = self._registrations[name]
-        if reg.descriptor.lifetime is Lifetime.SCOPED:
-            return HealthStatus.ok()  # created on demand; nothing running to poll
         if name in self._degraded:
             return HealthStatus.degraded("failed to start")
+        if reg.descriptor.lifetime is Lifetime.SCOPED:
+            return await self._scoped_status(name)
         instance = self._process.get(name)
         if instance is None:
             return HealthStatus.unhealthy("not running")
+        return await self._poll_health(instance)
+
+    async def _scoped_status(self, name: str) -> HealthStatus:
+        """Readiness for a scoped component: aggregate its live slices' health.
+
+        A scoped component with no live slice reports ``ok`` (nothing running to
+        poll). Otherwise every live slice is polled and the worst verdict wins,
+        so an unhealthy tenant slice can move readiness - a degraded one is
+        surfaced but, if the component is OPTIONAL, does not break it.
+        """
+        store = self._scoped_stores.get(name)
+        instances = [cast("AComponent[Any, Any, Any]", i) for _, i in store.items()] if store else []
+        statuses = [await self._poll_health(instance) for instance in instances]
+        if not statuses:
+            return HealthStatus.ok()
+        if any(s.state is Health.UNHEALTHY for s in statuses):
+            return next(s for s in statuses if s.state is Health.UNHEALTHY)
+        if any(s.state is Health.DEGRADED for s in statuses):
+            return next(s for s in statuses if s.state is Health.DEGRADED)
+        return HealthStatus.ok()
+
+    async def _poll_health(self, instance: AComponent[Any, Any, Any]) -> HealthStatus:
+        """Poll one instance's ``health()`` under the health timeout (not the chain)."""
         try:
             with anyio.fail_after(self._health_timeout):
-                return await instance.health()  # via timeout only, not the full chain
+                return await instance.health()
         except Exception:
             return HealthStatus.unhealthy("health check failed")
 
