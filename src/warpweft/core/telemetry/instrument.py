@@ -200,7 +200,15 @@ def instrument(
                         **axes_all,
                     },
                 )
-                duration.record(elapsed, {**operation_attr, conv.ATTR_STATUS: conv.STATUS_ERROR, **axes_allowed})
+                duration.record(
+                    elapsed,
+                    {
+                        **operation_attr,
+                        conv.ATTR_STATUS: conv.STATUS_ERROR,
+                        conv.ATTR_ERROR_CLASS: error_class,
+                        **axes_allowed,
+                    },
+                )
                 _enrich(span_enricher, span, ctx, None, exc)
                 raise
             else:

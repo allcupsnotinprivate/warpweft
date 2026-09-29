@@ -85,11 +85,9 @@ async def test_concurrent_tenant_spans_and_metrics_do_not_cross(container: Make)
     assert calls[("globex", conv.STATUS_OK)].value == 1
 
 
-@pytest.mark.characterization
-async def test_error_duration_point_has_no_error_class(container: Make) -> None:
-    # CHARACTERIZATION: the error-path calls counter carries warpweft.error.class,
-    # but the duration histogram's error point does not - you can count errors by
-    # class yet cannot get error latency by class.
+async def test_error_duration_point_carries_error_class(container: Make) -> None:
+    # The error-path duration histogram carries warpweft.error.class just like the
+    # calls counter, so error latency can be retrieved by class too.
     meter_provider, reader = metering()
 
     class Boom(AComponent[EmptySettings, None, str]):
@@ -106,8 +104,8 @@ async def test_error_duration_point_has_no_error_class(container: Make) -> None:
     metrics = read(reader)
     duration = sole_point(metrics[conv.METRIC_DURATION])
     calls = sole_point(metrics[conv.METRIC_CALLS])
-    assert conv.ATTR_ERROR_CLASS not in dict(duration.attributes)  # missing on the histogram
-    assert conv.ATTR_ERROR_CLASS in dict(calls.attributes)  # present on the counter
+    assert conv.ATTR_ERROR_CLASS in dict(duration.attributes)  # present on the histogram
+    assert dict(duration.attributes)[conv.ATTR_ERROR_CLASS] == dict(calls.attributes)[conv.ATTR_ERROR_CLASS]
 
 
 @pytest.mark.characterization
