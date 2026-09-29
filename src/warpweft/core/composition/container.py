@@ -393,7 +393,26 @@ class Container:
             instance.bind_invoker(self._invoker_for(component))
             return instance
 
-        instance: AComponent[Any, Any, Any] = await store.get_or_create(scope_key, factory)
+        # The lazy scoped start (inside get_or_create) gets the same treatment a
+        # process start does: bounded by init_timeout, and its failure routed by
+        # criticality. A REQUIRED slice that fails or hangs surfaces StartupError;
+        # an OPTIONAL one degrades the component and reports ComponentUnavailable.
+        # A failed start is never cached (get_or_create publishes only on success),
+        # so a REQUIRED slice re-attempts on the next invoke.
+        try:
+            with anyio.fail_after(self._init_timeout):
+                instance: AComponent[Any, Any, Any] = await store.get_or_create(scope_key, factory)
+        except ConfigurationError:
+            # A misconfiguration (e.g. a slice-override contradiction surfaced at
+            # first use) is a deploy-time bug, not a degradable startup failure:
+            # it propagates raw regardless of criticality.
+            raise
+        except Exception as exc:
+            if reg.descriptor.criticality is Criticality.REQUIRED:
+                raise StartupError(f"scoped component '{component}' failed to start: {exc}") from exc
+            logger.warning("optional component %r degraded: failed to start: %s", component, exc)
+            self._degraded.add(component)
+            raise ComponentUnavailable(f"component '{component}' is degraded") from exc
         return instance, scope_key
 
     async def _resolve_dependencies(self, names: tuple[str, ...]) -> dict[str, AComponent[Any, Any, Any]]:
