@@ -142,7 +142,9 @@ The container binds a live channel to every instance it creates (a scoped
 component gets one per slice, so per-tenant breakdown needs no code), recording
 through the container's meter provider under the instrumentation scope
 `warpweft.component` - separate from the `warpweft` scope, whose metric names
-are the framework's stability contract. A component constructed directly (unit
+are the framework's stability contract. A **PROCESS** component is bound once
+under `GLOBAL_SCOPE`, so its domain metrics carry no per-request axis pairs even
+when allowlisted - see [Axes that never reach telemetry](#axes-that-never-reach-telemetry). A component constructed directly (unit
 tests) gets a process-wide no-op: every call is accepted, nothing is recorded,
 nothing fails.
 
@@ -199,6 +201,31 @@ database, so:
   specific axis *values*: matching pairs are then attached to the histogram
   and ok-status counts too. The allowlist is value-based; a value shared by
   two different axes (e.g. `"prod"`) unlocks both pairs.
+
+## Axes that never reach telemetry
+
+Two axes drive runtime behaviour but are, by design, **absent** from the
+telemetry `scope_key` - so no span or metric point carries them, and no
+`axis_allowlist` can surface them. Both look like first-class axes elsewhere, so
+the gaps are worth stating outright:
+
+- **`endpoint`.** `use_endpoint` binds the endpoint around each invocation to
+  slice `[endpoint]` link state (breaker, concurrency), but the endpoint reaches
+  the telemetry `scope_key` *only* when a component declares `endpoint` in its
+  `ScopeSpec`. A component that returns an `endpoint()` without declaring the
+  axis still gets per-endpoint breaker/concurrency isolation, yet its spans and
+  metrics carry no `warpweft.axis.endpoint`. (Pinned by
+  `tests/core/telemetry/test_axes_capture.py::test_endpoint_never_reaches_axis_attributes`.)
+- **Per-request axes on a PROCESS component's domain metrics.** A process
+  component is instantiated once under `GLOBAL_SCOPE`, so the `self.telemetry`
+  channel bound to it is frozen at that scope: its domain metrics never carry
+  per-request axis pairs, even when the current value is allowlisted. Only a
+  SCOPED component gets its slice's axis pairs baked in (see
+  [Component metrics](#component-metrics)). (Pinned by
+  `test_process_domain_metrics_carry_no_axis_pairs`.)
+
+Surfacing either where it is already resolved is possible future work; today the
+absence is deliberate and tested.
 
 ## Semantics worth knowing
 
