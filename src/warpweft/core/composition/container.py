@@ -15,9 +15,9 @@ that talk to the same endpoint.
 from collections.abc import Callable, Coroutine, Mapping
 import contextlib
 from dataclasses import dataclass
+import functools
 import logging
 from typing import Any, TypeVar, cast
-import uuid
 
 import anyio
 import anyio.lowlevel
@@ -27,7 +27,7 @@ from warpweft.core.axes import GLOBAL_SCOPE, AxisRegistry, ScopeKey
 from warpweft.core.clock import Clock, SystemClock
 from warpweft.core.component import AComponent, Criticality, Descriptor, Health, HealthStatus, Lifetime
 from warpweft.core.component.settings import POLICY_FIELD
-from warpweft.core.context import InvocationContext, current_correlation_id, use_context
+from warpweft.core.context import InvocationContext, use_context
 from warpweft.core.errors import (
     ComponentUnavailable,
     ConfigurationError,
@@ -83,6 +83,16 @@ def _first_leaf(exc: BaseException) -> BaseException:
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         exc = exc.exceptions[0]
     return exc
+
+
+def _process_scope_key(name: str) -> ScopeKey:
+    """Link-state scope key a process component's spans/metrics line up under.
+
+    Process components run under GLOBAL_SCOPE for config but carry this
+    per-component key for link-state slicing; the invoke path and the dependency
+    proxy must emit byte-identical keys, so both route through here.
+    """
+    return (("component", name),)
 
 
 class _InvokeProxy:
@@ -285,7 +295,7 @@ class Container:
         instance, _ = self._instantiate(name, GLOBAL_SCOPE)
         instance.bind_dependencies(
             {
-                d: self._dependency_proxy(d, self._process[d], (("component", d),))
+                d: self._dependency_proxy(d, self._process[d], _process_scope_key(d))
                 for d in reg.descriptor.dependencies
                 if d in self._process
             }
@@ -358,19 +368,21 @@ class Container:
             if instance is None:
                 raise ComponentUnavailable(f"component '{component}' is degraded")
             chain = self._process_chains[(component, method)]
-            scope_key: ScopeKey = (("component", component),)
+            scope_key: ScopeKey = _process_scope_key(component)
         else:
             instance, scope_key = await self._scoped_instance(component)
             scoped_store = self._scoped_stores[component]
             chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
 
-        ctx = InvocationContext(
+        ctx = InvocationContext.begin(
             operation=f"{component}.{method}",
-            correlation_id=correlation_id or current_correlation_id() or uuid.uuid4().hex,
-            deadline=None if budget is None else self._clock.monotonic() + budget,
-            arguments=dict(arguments),
-            scope_key=scope_key,
+            # No ``parent``: invoke takes its id from the explicit arg or the
+            # ambient correlation id, never from a surrounding invocation.
+            correlation_id=correlation_id,
             clock=self._clock,
+            budget=budget,
+            scope_key=scope_key,
+            arguments=dict(arguments),
         )
         endpoint = instance.endpoint() or default_endpoint(instance.identity.uid, scope_key)
         # Pin the scoped instance before the first checkpoint: an LRU eviction
@@ -429,7 +441,7 @@ class Container:
             reg = self._registrations[name]
             if reg.descriptor.lifetime is Lifetime.PROCESS:
                 if name in self._process:
-                    resolved[name] = self._dependency_proxy(name, self._process[name], (("component", name),))
+                    resolved[name] = self._dependency_proxy(name, self._process[name], _process_scope_key(name))
             else:
                 instance, dep_scope = await self._scoped_instance(name)
                 resolved[name] = self._dependency_proxy(name, instance, dep_scope)
@@ -446,6 +458,17 @@ class Container:
         wrapping the bare instance, so guarded invocations never double up.
         """
         reg = self._registrations[name]
+        # One pre-bound bundle of the telemetry config; adding/removing a knob
+        # touches only this call. ``clock`` stays out of the bundle - it reaches
+        # instrument through ``ctx.clock`` - and lives once on the proxy.
+        instrument_factory = functools.partial(
+            instrument,
+            tracer_provider=self._tracer_provider,
+            meter_provider=self._meter_provider,
+            classifier=self._classifier,
+            config=self._telemetry,
+            span_enricher=self._span_enricher,
+        )
         return cast(
             "AComponent[Any, Any, Any]",
             DependencyTelemetryProxy(
@@ -454,11 +477,7 @@ class Container:
                 methods={n: spec.caller_view for n, spec in reg.descriptor.invocables.items()},
                 scope_key=scope_key,
                 clock=self._clock,
-                tracer_provider=self._tracer_provider,
-                meter_provider=self._meter_provider,
-                classifier=self._classifier,
-                config=self._telemetry,
-                span_enricher=self._span_enricher,
+                instrument_factory=instrument_factory,
             ),
         )
 

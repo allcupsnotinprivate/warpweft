@@ -22,16 +22,14 @@ from collections.abc import Callable, Mapping
 import functools
 import inspect
 from typing import Any, Final, get_type_hints
-import uuid
 
 from warpweft.core.axes import ScopeKey
 from warpweft.core.clock import Clock
-from warpweft.core.context import InvocationContext, current_context, current_correlation_id, use_context
-from warpweft.core.errors import ErrorClassifier
+from warpweft.core.context import InvocationContext, current_context, use_context
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.interceptor import Next
 
-from .instrument import DEFAULT_CONFIG, SpanEnricher, TelemetryConfig, instrument
+from .instrument import instrument
 
 #: Bag key carrying the raw ``(args, kwargs)`` of a call to the base link, so
 #: the method is invoked exactly as the caller wrote it (positionals intact).
@@ -71,11 +69,7 @@ class DependencyTelemetryProxy:
         methods: Mapping[str, CallerView | None],
         scope_key: ScopeKey,
         clock: Clock | None = None,
-        tracer_provider: Any = None,
-        meter_provider: Any = None,
-        classifier: ErrorClassifier | None = None,
-        config: TelemetryConfig = DEFAULT_CONFIG,
-        span_enricher: SpanEnricher | None = None,
+        instrument_factory: Callable[[Next], Next] = instrument,
     ) -> None:
         # Own state bypasses __setattr__, which forwards to the instance.
         object.__setattr__(self, "_ww_instance", instance)
@@ -89,19 +83,10 @@ class DependencyTelemetryProxy:
         object.__setattr__(self, "_ww_methods", frozenset(raw))
         object.__setattr__(self, "_ww_caller_views", raw)
         object.__setattr__(self, "_ww_scope_key", scope_key)
+        # ``clock`` lives here only - the instrument bundle carries the rest of
+        # the telemetry config; the clock reaches instrument via ``ctx.clock``.
         object.__setattr__(self, "_ww_clock", clock)
-        object.__setattr__(
-            self,
-            "_ww_instrument_kwargs",
-            {
-                "clock": clock,
-                "tracer_provider": tracer_provider,
-                "meter_provider": meter_provider,
-                "classifier": classifier,
-                "config": config,
-                "span_enricher": span_enricher,
-            },
-        )
+        object.__setattr__(self, "_ww_instrument", instrument_factory)
         object.__setattr__(self, "_ww_wrappers", {})
 
     @property  # type: ignore[misc]
@@ -121,7 +106,7 @@ class DependencyTelemetryProxy:
                     operation=f"{self._ww_component}.{item}",
                     scope_key=self._ww_scope_key,
                     clock=self._ww_clock,
-                    instrument_kwargs=self._ww_instrument_kwargs,
+                    instrument_factory=self._ww_instrument,
                     caller_view=self._ww_caller_views.get(item),
                 )
                 wrappers[item] = wrapper
@@ -206,7 +191,7 @@ def _wrap_method(
     operation: str,
     scope_key: ScopeKey,
     clock: Clock | None,
-    instrument_kwargs: dict[str, Any],
+    instrument_factory: Callable[[Next], Next],
     caller_view: CallerView | None = None,
 ) -> Any:
     """Build one instrumented wrapper around an invocable method.
@@ -280,24 +265,21 @@ def _wrap_method(
         result = await method(*args, **kwargs)
         return result if isinstance(result, Outcome) else Outcome(value=result)
 
-    instrumented: Next = instrument(base, **instrument_kwargs)
+    instrumented: Next = instrument_factory(base)
 
     @functools.wraps(template)
     async def call(*args: Any, **kwargs: Any) -> Any:
         method = resolve()  # the current target; used for both telemetry and the call
-        parent = current_context()
-        ctx = InvocationContext(
+        # The raw dependency path runs no timeout link, so no budget is passed:
+        # an inherited deadline would never be enforced, and a dead field would
+        # mislead a span_enricher/reader. Correlation id and clock fall back to
+        # the parent invocation through the shared ``begin`` factory.
+        ctx = InvocationContext.begin(
             operation=operation,
-            correlation_id=(parent.correlation_id if parent is not None else None)
-            or current_correlation_id()
-            or uuid.uuid4().hex,
-            # The raw dependency path runs no timeout link, so an inherited
-            # deadline would never be enforced; leave it unset rather than expose
-            # a dead field that misleads a span_enricher/reader.
-            deadline=None,
+            parent=current_context(),
+            clock=clock,
             scope_key=scope_key,
             arguments=_arguments(method, args, kwargs),
-            clock=clock or (parent.clock if parent is not None else None),
             bag={_CALL_KEY: (method, args, kwargs)},
         )
         with use_context(ctx):
