@@ -22,11 +22,10 @@ from collections.abc import Callable, Mapping
 import functools
 import inspect
 from typing import Any, Final, get_type_hints
-import uuid
 
 from warpweft.core.axes import ScopeKey
 from warpweft.core.clock import Clock
-from warpweft.core.context import InvocationContext, current_context, current_correlation_id, use_context
+from warpweft.core.context import InvocationContext, current_context, use_context
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.interceptor import Next
 
@@ -271,19 +270,16 @@ def _wrap_method(
     @functools.wraps(template)
     async def call(*args: Any, **kwargs: Any) -> Any:
         method = resolve()  # the current target; used for both telemetry and the call
-        parent = current_context()
-        ctx = InvocationContext(
+        # The raw dependency path runs no timeout link, so no budget is passed:
+        # an inherited deadline would never be enforced, and a dead field would
+        # mislead a span_enricher/reader. Correlation id and clock fall back to
+        # the parent invocation through the shared ``begin`` factory.
+        ctx = InvocationContext.begin(
             operation=operation,
-            correlation_id=(parent.correlation_id if parent is not None else None)
-            or current_correlation_id()
-            or uuid.uuid4().hex,
-            # The raw dependency path runs no timeout link, so an inherited
-            # deadline would never be enforced; leave it unset rather than expose
-            # a dead field that misleads a span_enricher/reader.
-            deadline=None,
+            parent=current_context(),
+            clock=clock,
             scope_key=scope_key,
             arguments=_arguments(method, args, kwargs),
-            clock=clock or (parent.clock if parent is not None else None),
             bag={_CALL_KEY: (method, args, kwargs)},
         )
         with use_context(ctx):

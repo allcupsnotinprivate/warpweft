@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any
+import uuid
 
 from .axes import GLOBAL_SCOPE, ScopeKey
 from .clock import Clock
@@ -44,6 +45,49 @@ class InvocationContext:
     bag: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
+    def begin(
+        cls,
+        operation: str,
+        *,
+        parent: "InvocationContext | None" = None,
+        correlation_id: str | None = None,
+        clock: Clock | None = None,
+        budget: float | None = None,
+        **fields: Any,
+    ) -> "InvocationContext":
+        """Open a context for a new invocation, resolving the shared entry policy.
+
+        The single place every invocation builder goes through, so the id,
+        clock and deadline rules cannot drift between the call paths:
+
+        - **correlation id**: explicit → parent's → ambient (`use_correlation_id`)
+          → a fresh uuid.
+        - **clock**: explicit → parent's.
+        - **deadline**: derived from ``budget`` (relative seconds) via the
+          resolved clock; unset when there is no budget. The clock is retained so
+          `remaining` and `expired` can be called without one.
+        """
+        resolved_clock = clock or (parent.clock if parent is not None else None)
+        resolved_id = (
+            correlation_id
+            or (parent.correlation_id if parent is not None else None)
+            or current_correlation_id()
+            or uuid.uuid4().hex
+        )
+        deadline = None
+        if budget is not None:
+            if resolved_clock is None:
+                raise ValueError("a budget needs a clock to derive the deadline")
+            deadline = resolved_clock.monotonic() + budget
+        return cls(
+            operation=operation,
+            correlation_id=resolved_id,
+            deadline=deadline,
+            clock=resolved_clock,
+            **fields,
+        )
+
+    @classmethod
     def start(
         cls,
         operation: str,
@@ -53,14 +97,13 @@ class InvocationContext:
         budget: float | None = None,
         **fields: Any,
     ) -> "InvocationContext":
-        """Build a fresh context, deriving an absolute deadline from ``budget``.
+        """Build a fresh context from an explicit id and clock (see `begin`).
 
-        ``budget`` is a relative number of seconds; the stored deadline is
-        ``clock.monotonic() + budget``. The clock is retained so
-        `remaining` and `expired` can be called without one.
+        A thin wrapper over `begin` for callers that already hold both: the
+        resolution chain is a no-op here, but routing through one factory keeps
+        the deadline-from-``budget`` rule in a single place.
         """
-        deadline = None if budget is None else clock.monotonic() + budget
-        return cls(operation=operation, correlation_id=correlation_id, deadline=deadline, clock=clock, **fields)
+        return cls.begin(operation, correlation_id=correlation_id, clock=clock, budget=budget, **fields)
 
     def _clock(self, clock: Clock | None) -> Clock:
         chosen = clock if clock is not None else self.clock

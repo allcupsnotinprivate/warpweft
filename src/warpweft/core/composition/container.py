@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import functools
 import logging
 from typing import Any, TypeVar, cast
-import uuid
 
 import anyio
 import anyio.lowlevel
@@ -28,7 +27,7 @@ from warpweft.core.axes import GLOBAL_SCOPE, AxisRegistry, ScopeKey
 from warpweft.core.clock import Clock, SystemClock
 from warpweft.core.component import AComponent, Criticality, Descriptor, Health, HealthStatus, Lifetime
 from warpweft.core.component.settings import POLICY_FIELD
-from warpweft.core.context import InvocationContext, current_correlation_id, use_context
+from warpweft.core.context import InvocationContext, use_context
 from warpweft.core.errors import (
     ComponentUnavailable,
     ConfigurationError,
@@ -375,13 +374,15 @@ class Container:
             scoped_store = self._scoped_stores[component]
             chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
 
-        ctx = InvocationContext(
+        ctx = InvocationContext.begin(
             operation=f"{component}.{method}",
-            correlation_id=correlation_id or current_correlation_id() or uuid.uuid4().hex,
-            deadline=None if budget is None else self._clock.monotonic() + budget,
-            arguments=dict(arguments),
-            scope_key=scope_key,
+            # No ``parent``: invoke takes its id from the explicit arg or the
+            # ambient correlation id, never from a surrounding invocation.
+            correlation_id=correlation_id,
             clock=self._clock,
+            budget=budget,
+            scope_key=scope_key,
+            arguments=dict(arguments),
         )
         endpoint = instance.endpoint() or default_endpoint(instance.identity.uid, scope_key)
         # Pin the scoped instance before the first checkpoint: an LRU eviction
