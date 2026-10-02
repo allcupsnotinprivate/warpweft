@@ -15,6 +15,7 @@ that talk to the same endpoint.
 from collections.abc import Callable, Coroutine, Mapping
 import contextlib
 from dataclasses import dataclass
+import functools
 import logging
 from typing import Any, TypeVar, cast
 import uuid
@@ -446,6 +447,17 @@ class Container:
         wrapping the bare instance, so guarded invocations never double up.
         """
         reg = self._registrations[name]
+        # One pre-bound bundle of the telemetry config; adding/removing a knob
+        # touches only this call. ``clock`` stays out of the bundle - it reaches
+        # instrument through ``ctx.clock`` - and lives once on the proxy.
+        instrument_factory = functools.partial(
+            instrument,
+            tracer_provider=self._tracer_provider,
+            meter_provider=self._meter_provider,
+            classifier=self._classifier,
+            config=self._telemetry,
+            span_enricher=self._span_enricher,
+        )
         return cast(
             "AComponent[Any, Any, Any]",
             DependencyTelemetryProxy(
@@ -454,11 +466,7 @@ class Container:
                 methods={n: spec.caller_view for n, spec in reg.descriptor.invocables.items()},
                 scope_key=scope_key,
                 clock=self._clock,
-                tracer_provider=self._tracer_provider,
-                meter_provider=self._meter_provider,
-                classifier=self._classifier,
-                config=self._telemetry,
-                span_enricher=self._span_enricher,
+                instrument_factory=instrument_factory,
             ),
         )
 

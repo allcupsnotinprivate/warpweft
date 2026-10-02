@@ -6,6 +6,7 @@ policy links. In-memory OTel providers per test; globals untouched.
 """
 
 from collections.abc import Mapping
+import functools
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -26,6 +27,7 @@ from warpweft.core.errors import PermanentError, TransientError
 from warpweft.core.outcome import Outcome
 from warpweft.core.telemetry import conventions as conv
 from warpweft.core.telemetry.dependency import DependencyTelemetryProxy
+from warpweft.core.telemetry.instrument import instrument
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -133,8 +135,9 @@ async def test_dependency_outcome_is_reported_not_rewrapped() -> None:
         component="cache",
         methods={"load": None},
         scope_key=GLOBAL_SCOPE,
-        tracer_provider=tracer_provider,
-        meter_provider=meter_provider,
+        instrument_factory=functools.partial(
+            instrument, tracer_provider=tracer_provider, meter_provider=meter_provider
+        ),
     )
     assert await proxy.load("k") == "v:k"  # caller still receives the bare value
 
@@ -259,7 +262,11 @@ async def test_callable_dependency_methods_are_not_proxy_instrumented() -> None:
             return "raw"
 
     proxy = DependencyTelemetryProxy(
-        Act(), component="act", methods={"run": None}, scope_key=GLOBAL_SCOPE, tracer_provider=provider
+        Act(),
+        component="act",
+        methods={"run": None},
+        scope_key=GLOBAL_SCOPE,
+        instrument_factory=functools.partial(instrument, tracer_provider=provider),
     )
     assert proxy() == "called"  # __call__ forwards to the instance's own chain
     assert await proxy.run() == "raw"  # invocable is left raw, not wrapped
