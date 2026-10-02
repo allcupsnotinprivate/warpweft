@@ -86,6 +86,16 @@ def _first_leaf(exc: BaseException) -> BaseException:
     return exc
 
 
+def _process_scope_key(name: str) -> ScopeKey:
+    """Link-state scope key a process component's spans/metrics line up under.
+
+    Process components run under GLOBAL_SCOPE for config but carry this
+    per-component key for link-state slicing; the invoke path and the dependency
+    proxy must emit byte-identical keys, so both route through here.
+    """
+    return (("component", name),)
+
+
 class _InvokeProxy:
     """Typed facade over ``Container.invoke`` for one component."""
 
@@ -286,7 +296,7 @@ class Container:
         instance, _ = self._instantiate(name, GLOBAL_SCOPE)
         instance.bind_dependencies(
             {
-                d: self._dependency_proxy(d, self._process[d], (("component", d),))
+                d: self._dependency_proxy(d, self._process[d], _process_scope_key(d))
                 for d in reg.descriptor.dependencies
                 if d in self._process
             }
@@ -359,7 +369,7 @@ class Container:
             if instance is None:
                 raise ComponentUnavailable(f"component '{component}' is degraded")
             chain = self._process_chains[(component, method)]
-            scope_key: ScopeKey = (("component", component),)
+            scope_key: ScopeKey = _process_scope_key(component)
         else:
             instance, scope_key = await self._scoped_instance(component)
             scoped_store = self._scoped_stores[component]
@@ -430,7 +440,7 @@ class Container:
             reg = self._registrations[name]
             if reg.descriptor.lifetime is Lifetime.PROCESS:
                 if name in self._process:
-                    resolved[name] = self._dependency_proxy(name, self._process[name], (("component", name),))
+                    resolved[name] = self._dependency_proxy(name, self._process[name], _process_scope_key(name))
             else:
                 instance, dep_scope = await self._scoped_instance(name)
                 resolved[name] = self._dependency_proxy(name, instance, dep_scope)
