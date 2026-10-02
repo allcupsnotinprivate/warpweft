@@ -106,20 +106,22 @@ class _OtelObserver:
     def __init__(
         self,
         tracer: trace.Tracer,
-        rejections: metrics.Counter,
-        transitions: metrics.Counter,
+        rejections: metrics.Counter | None,
+        transitions: metrics.Counter | None,
         counter_attrs: Mapping[str, AttributeValue],
     ) -> None:
         self._tracer = tracer
+        # ``None`` on the link-less path (no breaker to reject/transition); the
+        # matching events never fire there, so the guards below are defensive.
         self._rejections = rejections
         self._transitions = transitions
         self._counter_attrs = counter_attrs
 
     def event(self, name: str, attributes: Mapping[str, AttributeValue] | None = None) -> None:
         trace.get_current_span().add_event(name, attributes)
-        if name == EVENT_BREAKER_REJECTED:
+        if name == EVENT_BREAKER_REJECTED and self._rejections is not None:
             self._rejections.add(1, {**self._counter_attrs, **(attributes or {})})
-        elif name == EVENT_BREAKER_TRANSITION:
+        elif name == EVENT_BREAKER_TRANSITION and self._transitions is not None:
             self._transitions.add(1, {**self._counter_attrs, **(attributes or {})})
 
     def span(self, name: str, attributes: Mapping[str, AttributeValue] | None = None) -> AbstractContextManager[object]:
@@ -135,6 +137,7 @@ def instrument(
     classifier: ErrorClassifier | None = None,
     config: TelemetryConfig = DEFAULT_CONFIG,
     span_enricher: SpanEnricher | None = None,
+    full: bool = True,
 ) -> Next:
     """Wrap ``next_`` with the invocation span and the metrics contract.
 
@@ -148,6 +151,12 @@ def instrument(
     ``(span, ctx, None, exc)``) to attach application attributes to the
     invocation span. Its failures are swallowed and logged at ``debug``;
     cancellation bypasses it, as it bypasses the metrics.
+
+    ``full`` wires every metric. Set it ``False`` for a **link-less** caller -
+    the dependency proxy, which runs no policy chain: the breaker-rejection and
+    breaker-transition counters can never emit there, so their ``create_*``
+    lookups are skipped. The call/duration/degradations trio is kept: a
+    dependency may still self-report a degraded ``Outcome``.
     """
     tracer = (tracer_provider or trace.get_tracer_provider()).get_tracer(conv.INSTRUMENTATION_NAME, __version__)
     meter = (meter_provider or metrics.get_meter_provider()).get_meter(conv.INSTRUMENTATION_NAME, __version__)
@@ -158,12 +167,17 @@ def instrument(
     degradations = meter.create_counter(
         conv.METRIC_DEGRADATIONS, unit=conv.UNIT_CALLS, description="Calls answered by a stub"
     )
-    rejections = meter.create_counter(
-        conv.METRIC_BREAKER_REJECTIONS, unit=conv.UNIT_REJECTIONS, description="Calls rejected by an open breaker"
-    )
-    transitions = meter.create_counter(
-        conv.METRIC_BREAKER_TRANSITIONS, unit=conv.UNIT_TRANSITIONS, description="Circuit breaker state transitions"
-    )
+    # Breaker-only counters: created for the guarded path, skipped for the
+    # link-less proxy path where no breaker can ever reject or transition.
+    rejections: metrics.Counter | None = None
+    transitions: metrics.Counter | None = None
+    if full:
+        rejections = meter.create_counter(
+            conv.METRIC_BREAKER_REJECTIONS, unit=conv.UNIT_REJECTIONS, description="Calls rejected by an open breaker"
+        )
+        transitions = meter.create_counter(
+            conv.METRIC_BREAKER_TRANSITIONS, unit=conv.UNIT_TRANSITIONS, description="Circuit breaker state transitions"
+        )
     error_classifier = classifier or DefaultErrorClassifier()
 
     async def call(ctx: InvocationContext) -> Outcome[Any]:
