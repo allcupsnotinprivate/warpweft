@@ -461,6 +461,8 @@ class Container:
         # One pre-bound bundle of the telemetry config; adding/removing a knob
         # touches only this call. ``clock`` stays out of the bundle - it reaches
         # instrument through ``ctx.clock`` - and lives once on the proxy.
+        # ``full=False``: the proxy runs no policy links, so the breaker-only
+        # counters can never emit - skip their create_* lookups per wrapper.
         instrument_factory = functools.partial(
             instrument,
             tracer_provider=self._tracer_provider,
@@ -468,6 +470,7 @@ class Container:
             classifier=self._classifier,
             config=self._telemetry,
             span_enricher=self._span_enricher,
+            full=False,
         )
         return cast(
             "AComponent[Any, Any, Any]",
