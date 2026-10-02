@@ -170,6 +170,10 @@ class Container:
         self._scoped_max_entries = scoped_max_entries
         self._process: dict[str, AComponent[Any, Any, Any]] = {}
         self._process_chains: dict[tuple[str, str], Next] = {}
+        # One telemetry proxy per process dependency, shared across every
+        # consumer: its scope key is consumer-independent, so there is no reason
+        # to rebuild it per consuming instance (stable identity, no churn).
+        self._process_proxies: dict[str, AComponent[Any, Any, Any]] = {}
         self._degraded: set[str] = set()
         self._active_calls = 0
         self._started = False
@@ -294,11 +298,7 @@ class Container:
         reg = self._registrations[name]
         instance, _ = self._instantiate(name, GLOBAL_SCOPE)
         instance.bind_dependencies(
-            {
-                d: self._dependency_proxy(d, self._process[d], _process_scope_key(d))
-                for d in reg.descriptor.dependencies
-                if d in self._process
-            }
+            {d: self._process_dependency_proxy(d) for d in reg.descriptor.dependencies if d in self._process}
         )
         instance.bind_invoker(self._invoker_for(name))
         try:
@@ -337,6 +337,7 @@ class Container:
             with anyio.move_on_after(self._drain_timeout):
                 await instance.stop()
         self._process_chains.clear()
+        self._process_proxies.clear()  # drop proxies around the now-stopped instances
 
     # --- invocation ----------------------------------------------------------
 
@@ -441,11 +442,25 @@ class Container:
             reg = self._registrations[name]
             if reg.descriptor.lifetime is Lifetime.PROCESS:
                 if name in self._process:
-                    resolved[name] = self._dependency_proxy(name, self._process[name], _process_scope_key(name))
+                    resolved[name] = self._process_dependency_proxy(name)
             else:
                 instance, dep_scope = await self._scoped_instance(name)
                 resolved[name] = self._dependency_proxy(name, instance, dep_scope)
         return resolved
+
+    def _process_dependency_proxy(self, name: str) -> AComponent[Any, Any, Any]:
+        """The shared telemetry proxy for a running process dependency.
+
+        Built once and cached: a process component runs under one instance, and
+        its proxy's scope key (`_process_scope_key`) does not depend on the
+        consumer, so every consumer can inject the same proxy instead of
+        allocating a fresh one. Cleared when process instances stop.
+        """
+        cached = self._process_proxies.get(name)
+        if cached is None:
+            cached = self._dependency_proxy(name, self._process[name], _process_scope_key(name))
+            self._process_proxies[name] = cached
+        return cached
 
     def _dependency_proxy(
         self, name: str, instance: AComponent[Any, Any, Any], scope_key: ScopeKey
