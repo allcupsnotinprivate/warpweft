@@ -85,10 +85,11 @@ async def test_get_returns_the_running_instance() -> None:
     search = await container.get(Search)
     assert isinstance(search, Search)
     # The injected dependency is the live instance behind a telemetry proxy:
-    # isinstance still holds, and the proxy wraps the very same instance.
+    # isinstance still holds, and the proxy compares equal to the bare instance
+    # (it forwards ==/hash) - no reaching through to a private field.
     embedder = await container.get(Embedder)
     assert isinstance(search.embedder, Embedder)
-    assert search.embedder._ww_instance is embedder  # type: ignore[attr-defined]
+    assert search.embedder == embedder
     assert await container.get("search") is search  # by-name form
     await container.stop()
 
