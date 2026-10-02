@@ -18,7 +18,7 @@ prefix is imposed. The meter uses its own instrumentation scope,
 ``warpweft`` scope whose names are the framework's stability contract.
 """
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Final
@@ -34,28 +34,42 @@ from . import conventions as conv
 from .instrument import _axis_attrs
 
 
-class ComponentCounter:
-    """Counter with the component's identity attributes mixed in."""
+class _ComponentInstrument:
+    """Shared body of the component instrument wrappers.
 
-    def __init__(self, counter: metrics.Counter, auto: Mapping[str, AttributeValue]) -> None:
-        self._counter = counter
+    Holds the bound ``add``/``record`` of the underlying OTel instrument and the
+    component's identity attributes, and owns the one merge rule: automatic
+    attributes win over the caller's. Subclasses add nothing but the
+    conventionally named public method (``add`` for a counter, ``record`` for a
+    histogram); a future UpDownCounter or Gauge is a three-line subclass.
+    """
+
+    def __init__(
+        self,
+        emit: Callable[[int | float, Mapping[str, AttributeValue]], None],
+        auto: Mapping[str, AttributeValue],
+    ) -> None:
+        self._emit = emit
         self._auto = auto
+
+    def _record(self, value: int | float, attributes: Mapping[str, AttributeValue] | None) -> None:
+        self._emit(value, {**(attributes or {}), **self._auto})
+
+
+class ComponentCounter(_ComponentInstrument):
+    """Counter with the component's identity attributes mixed in."""
 
     def add(self, value: int | float, attributes: Mapping[str, AttributeValue] | None = None) -> None:
         """Record an increment; automatic attributes win over ``attributes``."""
-        self._counter.add(value, {**(attributes or {}), **self._auto})
+        self._record(value, attributes)
 
 
-class ComponentHistogram:
+class ComponentHistogram(_ComponentInstrument):
     """Histogram with the component's identity attributes mixed in."""
-
-    def __init__(self, histogram: metrics.Histogram, auto: Mapping[str, AttributeValue]) -> None:
-        self._histogram = histogram
-        self._auto = auto
 
     def record(self, value: int | float, attributes: Mapping[str, AttributeValue] | None = None) -> None:
         """Record a measurement; automatic attributes win over ``attributes``."""
-        self._histogram.record(value, {**(attributes or {}), **self._auto})
+        self._record(value, attributes)
 
 
 class ComponentTelemetry:
@@ -86,7 +100,9 @@ class ComponentTelemetry:
         """A named counter (cached); ``unit``/``description`` apply on first creation."""
         cached = self._counters.get(name)
         if cached is None:
-            cached = ComponentCounter(self._meter.create_counter(name, unit=unit, description=description), self._auto)
+            cached = ComponentCounter(
+                self._meter.create_counter(name, unit=unit, description=description).add, self._auto
+            )
             self._counters[name] = cached
         return cached
 
@@ -95,7 +111,7 @@ class ComponentTelemetry:
         cached = self._histograms.get(name)
         if cached is None:
             cached = ComponentHistogram(
-                self._meter.create_histogram(name, unit=unit, description=description), self._auto
+                self._meter.create_histogram(name, unit=unit, description=description).record, self._auto
             )
             self._histograms[name] = cached
         return cached
