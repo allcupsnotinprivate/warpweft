@@ -18,12 +18,26 @@ def test_icon_sizes_become_a_tuple_so_the_icon_stays_hashable() -> None:
     assert hash(icon) == hash(Icon("https://example.com/i.svg", sizes=("any",)))
 
 
+def test_a_bare_size_string_is_one_size() -> None:
+    # str is a Sequence[str] too; "48x48" must not become five one-character sizes.
+    assert Icon("https://example.com/i.png", sizes="48x48").sizes == ("48x48",)
+
+
 @pytest.mark.parametrize(
     "src",
-    ["http://localhost/i.png", "file:///i.png", "javascript:alert(1)", "i.png", ""],
-    ids=["http", "file", "javascript", "relative", "empty"],
+    [
+        "http://localhost/i.png",
+        "file:///i.png",
+        "javascript:alert(1)",
+        "i.png",
+        "",
+        "https:",
+        "https:///i.png",
+        "data:",
+    ],
+    ids=["http", "file", "javascript", "relative", "empty", "bare-https", "https-no-host", "bare-data"],
 )
-def test_icon_rejects_every_other_scheme(src: str) -> None:
+def test_icon_rejects_every_other_scheme_or_an_empty_source(src: str) -> None:
     # The spec has clients reject these, so a server should not define one.
     with pytest.raises(ValueError, match="https: URL or a data: URI"):
         Icon(src)

@@ -78,7 +78,7 @@ class ServerOptions(TypedDict, total=False):
     #: Icons for the server. On the 2026-07-28 protocol the SDK stamps
     #: ``serverInfo``, icons included, into every response, so give the server
     #: ``https:`` URLs and keep ``data:`` URIs for tool icons.
-    icons: Sequence[Icon]
+    icons: Sequence[Icon] | None
     #: Serve only tools carrying one of these ``@tool`` tags (see `collect_tools`),
     #: so one app can back several servers - e.g. ``{"public"}`` for an assistant.
     tags: Collection[str] | None
@@ -497,13 +497,20 @@ def _bind_axes(
             stack.enter_context(handle.use(value))
 
 
+def _check_icons(icons: Sequence[Any], owner: str) -> None:
+    """Catch icons that slipped past typing (an action's ``icons`` attribute, say) before a client lists them."""
+    bad = [icon for icon in icons if not isinstance(icon, Icon)]
+    if bad:
+        raise FrameworkError(f"{owner} has icon(s) that are not warpweft.mcp.Icon: {bad!r}")
+
+
 def _served_tools(app: App, options: ServerOptions, *, has_runner: bool) -> dict[str, ToolBinding]:
     """The tools a server would serve, by name - or a `FrameworkError` saying why it cannot.
 
     The whole build-time validation: the filters must select something, no
-    tool may claim a reserved task-tool name, and background tools need a
-    runner. Pure registry reads, so `open_server` runs it before starting
-    anything.
+    tool may claim a reserved task-tool name, background tools need a runner,
+    and every icon is an `Icon`. Pure registry reads, so `open_server` runs it
+    before starting anything.
     """
     found = collect_tools(app, tags=options.get("tags"), include=options.get("include"), exclude=options.get("exclude"))
     bindings = {b.name: b for b in found}
@@ -518,6 +525,10 @@ def _served_tools(app: App, options: ServerOptions, *, has_runner: bool) -> dict
             f"tool(s) {background} are @tool(background=True) but the server has no task runner; "
             "pass build_server(..., runner=...) (see warpweft.mcp.tasks.task_runner)"
         )
+
+    for binding in bindings.values():
+        _check_icons(binding.meta.icons, f"tool '{binding.name}'")
+    _check_icons(options.get("icons") or (), "the server")
     return bindings
 
 
@@ -614,7 +625,7 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
         description=options.get("description"),
         instructions=options.get("instructions"),
         website_url=options.get("website_url"),
-        icons=_mcp_icons(options.get("icons", ())),
+        icons=_mcp_icons(options.get("icons") or ()),
         on_list_tools=on_list_tools,
         on_call_tool=cast(Any, on_call_tool),
     )

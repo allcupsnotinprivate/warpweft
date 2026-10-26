@@ -200,14 +200,23 @@ def _cmd_serve(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+#: ``serve`` flags that set a server-identity `ServerOptions` entry of the same name.
+_IDENTITY_FLAGS = ("name", "title", "description", "website_url")
+
+
 def _identity_options(args: argparse.Namespace) -> dict[str, Any]:
     """The server-identity options the user set; an unset one keeps the library default."""
-    options: dict[str, Any] = {k: v for k in ("name", "title") if (v := getattr(args, k)) is not None}
+    options: dict[str, Any] = {k: v for k in _IDENTITY_FLAGS if (v := getattr(args, k)) is not None}
+    if args.server_version is not None:
+        options["version"] = args.server_version
     if args.instructions_file is not None:
         try:
-            options["instructions"] = Path(args.instructions_file).read_text(encoding="utf-8")
-        except OSError as exc:
+            text = Path(args.instructions_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             raise SystemExit(f"error: cannot read --instructions-file: {exc}") from exc
+        if not text.strip():
+            raise SystemExit(f"error: --instructions-file {args.instructions_file} is empty")
+        options["instructions"] = text
     return options
 
 
@@ -264,9 +273,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--no-background", action="store_true", help="Serve without a background task runner.")
     serve.add_argument("--name", help="Server name reported to clients. Default: warpweft.")
+    serve.add_argument("--server-version", metavar="VERSION", help="Server version reported to clients. Default: 0.")
     serve.add_argument("--title", help="Human-friendly server name for the client's UI.")
+    serve.add_argument("--description", help="What the server is, in a sentence.")
+    serve.add_argument("--website-url", metavar="URL", help="The server's website.")
     serve.add_argument(
-        "--instructions-file", metavar="PATH", help="File with guidance for the model (server instructions)."
+        "--instructions-file",
+        metavar="PATH",
+        help="File with guidance for the model (server instructions); must not be empty.",
     )
     return parser
 

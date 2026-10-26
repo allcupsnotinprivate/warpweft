@@ -13,6 +13,7 @@ everything else (health checks, internal helpers) stays private by default.
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar, overload
+from urllib.parse import urlsplit
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -32,9 +33,10 @@ class Icon:
     ``src`` is an ``https:`` URL or a ``data:`` URI carrying the image inline;
     ``mime_type`` names the image type when the source does not; ``sizes``
     lists the sizes the icon renders well at (``"48x48"``, or ``"any"`` for a
-    scalable image) and ``theme`` the background it was drawn for. Clients pick
-    the icon that fits their UI. A ``data:`` icon travels with every message
-    that carries it, so prefer URLs for server icons (see ``ServerOptions``).
+    scalable image; a single size may be a bare string) and ``theme`` the
+    background it was drawn for. Clients pick the icon that fits their UI. A
+    ``data:`` icon travels with every message that carries it, so prefer URLs
+    for server icons (see ``ServerOptions``).
     """
 
     src: str
@@ -43,12 +45,22 @@ class Icon:
     theme: Literal["light", "dark"] | None = None
 
     def __post_init__(self) -> None:
-        scheme, sep, _ = self.src.partition(":")
-        if not sep or scheme.lower() not in _ICON_SCHEMES:
+        if not _icon_source_ok(self.src):
             raise ValueError(f"icon src must be an https: URL or a data: URI, got {self.src!r}")
         if self.theme is not None and self.theme not in _ICON_THEMES:
             raise ValueError(f"icon theme must be 'light' or 'dark', got {self.theme!r}")
-        object.__setattr__(self, "sizes", tuple(self.sizes))  # hashable, like the rest of the metadata
+        # A bare "48x48" is one size, not five characters; a tuple keeps the icon hashable.
+        sizes = (self.sizes,) if isinstance(self.sizes, str) else tuple(self.sizes)
+        object.__setattr__(self, "sizes", sizes)
+
+
+def _icon_source_ok(src: str) -> bool:
+    """``https://<host>...`` or ``data:<payload>``: a scheme clients fetch, with something behind it."""
+    scheme, sep, rest = src.partition(":")
+    scheme = scheme.lower()
+    if not sep or scheme not in _ICON_SCHEMES or not rest:
+        return False
+    return scheme == "data" or bool(urlsplit(src).netloc)
 
 
 @dataclass(frozen=True)

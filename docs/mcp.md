@@ -156,9 +156,10 @@ warpweft serve --app myapp.main:app --title Billing --instructions-file mcp-inst
 ```
 
 `--tag`, `--include` and `--exclude` take one value each and can be repeated.
-`--name`, `--title` and `--instructions-file` set the
-[server metadata](#server-metadata); the instructions come from a file because
-they are usually several lines.
+`--name`, `--server-version`, `--title`, `--description`, `--website-url` and
+`--instructions-file` set the [server metadata](#server-metadata); the
+instructions come from a file, because they are usually several lines, and the
+file must not be empty.
 `warpweft serve --help` lists the HTTP options.
 
 ### Custom transports

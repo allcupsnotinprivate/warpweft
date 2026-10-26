@@ -173,6 +173,27 @@ async def test_tool_icons_are_listed(connect) -> None:
     assert tools["search__query"].icons is None  # none defined, none advertised
 
 
+def test_icons_that_are_not_icons_fail_at_build() -> None:
+    # Typing catches this in checked code; an unchecked `icons` attribute must
+    # not get as far as a client's tools/list.
+    class Sloppy(AComponent[EmptySettings, None, int]):
+        name = "sloppy"
+
+        @tool(icons=["https://example.com/i.png"])  # type: ignore[list-item]
+        @invocable
+        async def one(self) -> int:
+            return 1
+
+    with pytest.raises(FrameworkError, match=r"tool 'sloppy__one' has icon\(s\) that are not warpweft.mcp.Icon"):
+        build_server(app_with(Sloppy))
+    with pytest.raises(FrameworkError, match=r"the server has icon\(s\)"):
+        build_server(app_with(Search), icons=[{"src": "https://example.com/i.png"}])  # type: ignore[list-item]
+
+
+def test_server_icons_may_be_none() -> None:
+    build_server(app_with(Search), icons=None)  # an optional setting forwarded unset
+
+
 # --- server metadata -----------------------------------------------------------
 
 METADATA: dict[str, Any] = {

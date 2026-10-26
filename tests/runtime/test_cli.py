@@ -269,17 +269,35 @@ def test_serve_passes_server_metadata(
     instructions = tmp_path / "instructions.md"
     instructions.write_text("Look the account up first.\n", encoding="utf-8")
     calls = _record_calls(monkeypatch, "server.run_stdio")
-    argv = ["serve", "--name", "billing", "--title", "Billing", "--instructions-file", str(instructions)]
+    argv = ["serve", "--name", "billing", "--server-version", "2.3", "--title", "Billing"]
+    argv += ["--description", "Invoices.", "--website-url", "https://example.com"]
+    argv += ["--instructions-file", str(instructions)]
     code, _, _ = run(capsys, "--app", APP, *argv)
     assert code == 0
     [call] = calls
-    assert {k: call[k] for k in ("name", "title", "instructions")} == {
+    identity = ("name", "version", "title", "description", "website_url", "instructions")
+    assert {k: call[k] for k in identity} == {
         "name": "billing",
+        "version": "2.3",
         "title": "Billing",
+        "description": "Invoices.",
+        "website_url": "https://example.com",
         "instructions": "Look the account up first.\n",
     }
 
 
-def test_serve_reports_an_unreadable_instructions_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("content", [None, b"\xff\xfe"], ids=["missing", "not-utf8"])
+def test_serve_reports_an_unreadable_instructions_file(tmp_path: Path, content: bytes | None) -> None:
+    path = tmp_path / "instructions.md"
+    if content is not None:
+        path.write_bytes(content)
     with pytest.raises(SystemExit, match=r"cannot read --instructions-file"):
-        main(["--app", APP, "serve", "--instructions-file", str(tmp_path / "missing.md")])
+        main(["--app", APP, "serve", "--instructions-file", str(path)])
+
+
+def test_serve_rejects_an_empty_instructions_file(tmp_path: Path) -> None:
+    # A placeholder file would otherwise send clients instructions="".
+    path = tmp_path / "instructions.md"
+    path.write_text("  \n", encoding="utf-8")
+    with pytest.raises(SystemExit, match=r"--instructions-file .* is empty"):
+        main(["--app", APP, "serve", "--instructions-file", str(path)])
