@@ -119,10 +119,10 @@ def asgi_app(
     Transport (passed to the mcp SDK):
 
     - ``stateless`` - no ``Mcp-Session-Id`` session per client: every request
-      stands alone, so it scales across workers but the server cannot send
-      requests back to the client mid-call (no elicitation).
+      stands alone, so it scales across workers, but a handshake-protocol
+      client cannot be sent a request mid-call.
     - ``json_response`` - answer with a single JSON body instead of an SSE
-      stream. Same limitation: no server-initiated requests.
+      stream. Same limitation for handshake-protocol clients.
     - ``host`` - the address the server is reached on. For a loopback host
       (the default) DNS-rebinding protection is switched on automatically;
       pass ``transport_security`` to configure it explicitly.
@@ -138,10 +138,11 @@ def asgi_app(
     `ServerOptions`, passed through to `build_server`.
 
     The client's ``initialize`` handshake and the 2026-07-28 per-request
-    protocol are both served. Server-initiated requests - the elicitation behind
-    ``confirm_destructive`` - need a stateful session with SSE responses on the
-    handshake protocol; elsewhere a destructive tool is refused with
-    ``confirmation_unsupported`` rather than run unconfirmed.
+    protocol are both served. On 2026-07-28 the elicitation behind
+    ``confirm_destructive`` travels by multi-round-trip and works in every mode;
+    on the handshake protocol it needs a stateful session with SSE responses,
+    and elsewhere a destructive tool is refused with ``confirmation_unsupported``
+    rather than run unconfirmed.
     """
     http: dict[str, Any] = {
         "streamable_http_path": path,

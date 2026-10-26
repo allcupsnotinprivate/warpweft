@@ -24,6 +24,7 @@ from mcp.server.lowlevel.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import NoBackChannelError
 import mcp.types as mt
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import ValidationError
 
 from warpweft.core.component import InvocableSpec, describe
@@ -373,6 +374,10 @@ def _status_result(view: TaskStatusView) -> mt.CallToolResult:
 
 
 _ELICITATION = mt.ClientCapabilities(elicitation=mt.ElicitationCapability())
+#: The confirmation form asks for no fields: the decision is the action itself.
+_NO_FIELDS: dict[str, Any] = {"type": "object", "properties": {}}
+#: The ``input_requests`` / ``input_responses`` key the confirmation travels under.
+_CONFIRM_INPUT = "confirm"
 
 
 def _refusal(text: str, *, code: str, retryable: bool = False) -> mt.CallToolResult:
@@ -380,12 +385,27 @@ def _refusal(text: str, *, code: str, retryable: bool = False) -> mt.CallToolRes
     return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)], is_error=True, meta=meta)
 
 
-async def _confirm_destructive(ctx: Any, binding: ToolBinding) -> mt.CallToolResult | None:
+async def _confirm_destructive(
+    ctx: Any, binding: ToolBinding, params: mt.CallToolRequestParams
+) -> mt.CallToolResult | mt.InputRequiredResult | None:
     """Ask the user to confirm a destructive call; ``None`` means proceed.
 
-    Fails closed: when the operator demanded confirmation, a client that
-    cannot elicit gets an error, never an unconfirmed execution. The decision
-    is the elicitation ``action`` itself, so the form requests no fields.
+    The question travels by the protocol's own mechanism:
+
+    - **2026-07-28** (per-request protocol): multi-round-trip. The first call
+      returns an `InputRequiredResult` carrying the elicitation; the client
+      asks the user and retries the call with the answer in
+      ``input_responses``. Works on every transport, stateless HTTP included.
+    - **Handshake versions**: the server sends ``elicitation/create`` mid-call
+      over the session's back channel, which needs a connection that can carry
+      it (stdio, or stateful HTTP with SSE responses).
+
+    Fails closed: a client that cannot elicit, or a connection that cannot
+    carry the question, gets an error, never an unconfirmed execution. The
+    decision is the elicitation ``action`` itself, so the form requests no
+    fields. The answer comes from the client - the same party that renders
+    the question - so an unsolicited accept is no weaker than a client that
+    auto-accepts.
     """
     if not ctx.session.check_client_capability(_ELICITATION):
         return _refusal(
@@ -393,21 +413,27 @@ async def _confirm_destructive(ctx: Any, binding: ToolBinding) -> mt.CallToolRes
             code="confirmation_unsupported",
         )
     label = binding.meta.title or binding.name
-    try:
-        result = await ctx.session.elicit_form(
-            f"Confirm running '{label}'. This action is marked destructive.",
-            {"type": "object", "properties": {}},
-            related_request_id=ctx.request_id,
-        )
-    except NoBackChannelError:
-        # The client can elicit, but this connection cannot carry a
-        # server-initiated request (stateless HTTP, JSON responses, or the
-        # 2026-07-28 per-request era). Still fail closed, as a tool error.
-        return _refusal(
-            f"tool '{binding.name}' requires user confirmation, but this connection cannot carry an elicitation",
-            code="confirmation_unsupported",
-        )
-    if result.action != "accept":
+    message = f"Confirm running '{label}'. This action is marked destructive."
+
+    if ctx.protocol_version in MODERN_PROTOCOL_VERSIONS:
+        answer = (params.input_responses or {}).get(_CONFIRM_INPUT)
+        if answer is None:
+            request = mt.ElicitRequest(params=mt.ElicitRequestFormParams(message=message, requested_schema=_NO_FIELDS))
+            return mt.InputRequiredResult(input_requests={_CONFIRM_INPUT: request})
+        accepted = isinstance(answer, mt.ElicitResult) and answer.action == "accept"
+    else:
+        try:
+            result = await ctx.session.elicit_form(message, _NO_FIELDS, related_request_id=ctx.request_id)
+        except NoBackChannelError:
+            # The client can elicit, but this connection cannot carry a
+            # server-initiated request (stateless HTTP or JSON responses).
+            return _refusal(
+                f"tool '{binding.name}' requires user confirmation, but this connection cannot carry an elicitation",
+                code="confirmation_unsupported",
+            )
+        accepted = result.action == "accept"
+
+    if not accepted:
         return _refusal(f"the user declined to run '{binding.name}'", code="declined")
     return None
 
@@ -488,7 +514,7 @@ def build_server(
         tools = [_describe_tool(classes[b.component], b) for b in bindings.values()]
         return mt.ListToolsResult(tools=tools + task_tools)
 
-    async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> mt.CallToolResult:
+    async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> mt.CallToolResult | mt.InputRequiredResult:
         if params.name in _RESERVED_NAMES:
             return await _handle_task_tool(runner, params)
 
@@ -509,7 +535,7 @@ def build_server(
         # would fail anyway) and before any execution - including a background
         # submit, so the task never starts without consent.
         if confirm_destructive and binding.meta.destructive:
-            denial = await _confirm_destructive(ctx, binding)
+            denial = await _confirm_destructive(ctx, binding, params)
             if denial is not None:
                 return denial
 

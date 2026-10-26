@@ -93,9 +93,10 @@ The HTTP plumbing comes from the mcp SDK and is configured through `asgi_app`:
 | `session_idle_timeout`, `max_sessions` | limits for stateful sessions |
 
 Both the `initialize` handshake protocol and the 2026-07-28 per-request
-protocol are served; the client chooses. Some features need the server to send
-a request back to the client mid-call, which only a stateful session with SSE
-responses on the handshake protocol can carry. Today that affects
+protocol are served; the client chooses (the mcp SDK client picks 2026-07-28).
+On the handshake protocol, a server-initiated request mid-call needs a
+stateful session with SSE responses; the 2026-07-28 protocol asks the client by
+multi-round-trip instead and works in every mode. Today this matters for
 [destructive-tool confirmation](#confirming-destructive-tools).
 
 `run_http` runs on asyncio only, because uvicorn does. Under trio, serve
@@ -319,14 +320,22 @@ build_server(app, confirm_destructive=True)
 puts a human in the loop for every tool marked `destructive=True`: before
 executing, the server sends an MCP elicitation that the client presents to
 the user. Only an explicit accept runs the tool - decline or cancel returns a
-tool error (`warpweft.error: "declined"`) without executing anything. The
-gate fails closed: a client that does not support elicitation gets
-`confirmation_unsupported` instead of an unconfirmed execution. So does a
-connection that cannot carry the elicitation request: over HTTP that is
-anything but a stateful session with SSE responses on the handshake protocol
-(see [Streamable HTTP](#streamable-http)). Confirmation
-happens after argument validation and never applies to non-destructive
-tools.
+tool error (`warpweft.error: "declined"`) without executing anything.
+Confirmation happens after argument validation - and before a
+[background](#background-long-running-tools) submit - and never applies to
+non-destructive tools.
+
+The question travels by whichever mechanism the protocol has:
+
+| Protocol | How the user is asked | Where it works |
+| --- | --- | --- |
+| 2026-07-28 | the call returns an `InputRequiredResult`; the client asks the user and retries the call with the answer | every transport and mode |
+| handshake (`initialize`) | the server sends `elicitation/create` mid-call | stdio, and HTTP with stateful sessions and SSE responses |
+
+The gate fails closed: a client that does not support elicitation, or a
+handshake connection that cannot carry the request (stateless HTTP, JSON
+responses), gets `confirmation_unsupported` instead of an unconfirmed
+execution.
 
 Off by default - the `destructive` annotation alone only *hints* to the host
 UI; this flag turns it into an enforced contract.

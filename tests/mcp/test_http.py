@@ -253,7 +253,6 @@ async def test_an_invalid_token_is_rejected() -> None:
     [
         pytest.param({"stateless": True}, "legacy", id="stateless"),
         pytest.param({"json_response": True}, "legacy", id="json-response"),
-        pytest.param({}, "2026-07-28", id="per-request-protocol"),
     ],
 )
 async def test_confirmation_without_a_back_channel_fails_closed(transport: dict[str, Any], protocol: str) -> None:
@@ -265,6 +264,66 @@ async def test_confirmation_without_a_back_channel_fails_closed(transport: dict[
     assert result.is_error
     assert result.meta is not None
     assert result.meta["warpweft.error"] == "confirmation_unsupported"
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_per_request_protocol_confirms_by_round_trip(transport: dict[str, Any]) -> None:
+    # 2026-07-28: the question rides an InputRequiredResult and the answer the
+    # retried call, so it works on every transport - stateless included.
+    asked: list[str] = []
+
+    async def accept_and_record(context: Any, params: Any) -> mt.ElicitResult:
+        asked.append(params.message)
+        return mt.ElicitResult(action="accept", content={})
+
+    mcp = asgi_app(echo_app(), confirm_destructive=True, **transport)
+    async with serving(mcp, mode="2026-07-28", elicitation_callback=accept_and_record) as client:
+        result = await client.call_tool("echo__wipe", {})
+    assert not result.is_error
+    assert result.structured_content == {"result": "wiped"}
+    assert asked == ["Confirm running 'echo__wipe'. This action is marked destructive."]
+
+
+async def test_per_request_protocol_decline_does_not_run() -> None:
+    async def decline(context: Any, params: Any) -> mt.ElicitResult:
+        return mt.ElicitResult(action="decline")
+
+    mcp = asgi_app(echo_app(), confirm_destructive=True)
+    async with serving(mcp, mode="2026-07-28", elicitation_callback=decline) as client:
+        result = await client.call_tool("echo__wipe", {})
+    assert result.is_error
+    assert result.meta is not None
+    assert result.meta["warpweft.error"] == "declined"
+
+
+async def test_per_request_protocol_without_elicitation_fails_closed() -> None:
+    mcp = asgi_app(echo_app(), confirm_destructive=True)
+    async with serving(mcp, mode="2026-07-28") as client:  # no elicitation callback: capability not declared
+        result = await client.call_tool("echo__wipe", {})
+    assert result.meta is not None
+    assert result.meta["warpweft.error"] == "confirmation_unsupported"
+
+
+async def test_per_request_protocol_confirms_before_a_background_submit() -> None:
+    class Purger(AComponent[EmptySettings, None, str]):
+        name = "purger"
+
+        @tool(background=True, destructive=True)
+        @invocable
+        async def purge(self) -> str:
+            return "purged"
+
+    reg = Registry()
+    reg.register(Purger)
+
+    async def decline(context: Any, params: Any) -> mt.ElicitResult:
+        return mt.ElicitResult(action="decline")
+
+    mcp = asgi_app(App(registry=reg), confirm_destructive=True)
+    async with serving(mcp, mode="2026-07-28", elicitation_callback=decline) as client:
+        result = await client.call_tool("purger__purge", {})
+    assert result.meta is not None
+    assert result.meta["warpweft.error"] == "declined"  # refused before any task was submitted
 
 
 @pytest.mark.e2e
