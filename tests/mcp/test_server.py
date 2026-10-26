@@ -1,5 +1,7 @@
 """warpweft.mcp: tool discovery, schemas, and end-to-end call routing."""
 
+from collections.abc import AsyncIterator
+import contextlib
 from typing import Any
 
 import anyio
@@ -21,7 +23,7 @@ from warpweft.core.errors import (
     TransientError,
 )
 from warpweft.core.formats import Ipv4
-from warpweft.mcp import build_server, collect_tools, tool
+from warpweft.mcp import Icon, build_server, collect_tools, tool
 from warpweft.mcp.errors import error_result
 from warpweft.runtime import App
 
@@ -66,6 +68,13 @@ def app_with(*classes: type[AComponent[Any, Any, Any]]) -> App:
     for cls in classes:
         reg.register(cls)
     return App(registry=reg)
+
+
+@contextlib.asynccontextmanager
+async def connected_as(app: App, mode: str, **options: Any) -> AsyncIterator[Client]:
+    """A connected SDK client on one protocol era (the ``connect`` fixture speaks only the handshake)."""
+    async with app.run(), Client(build_server(app, **options), mode=mode) as client:
+        yield client
 
 
 # --- discovery ---------------------------------------------------------------
@@ -145,6 +154,81 @@ async def test_description_falls_back_to_the_docstring(connect) -> None:
         result = await client.list_tools()
     (tool_def,) = result.tools
     assert tool_def.description == "Return a user profile."
+
+
+async def test_tool_icons_are_listed(connect) -> None:
+    icon = Icon("data:image/png;base64,AA==", mime_type="image/png")
+
+    class Branded(AComponent[EmptySettings, None, int]):
+        name = "branded"
+
+        @tool(icons=[icon])
+        @invocable
+        async def one(self) -> int:
+            return 1
+
+    async with connect(app_with(Branded, Search)) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    assert tools["branded__one"].icons == [mt.Icon(src=icon.src, mime_type="image/png")]
+    assert tools["search__query"].icons is None  # none defined, none advertised
+
+
+def test_icons_that_are_not_icons_fail_at_build() -> None:
+    # Typing catches this in checked code; an unchecked `icons` attribute must
+    # not get as far as a client's tools/list.
+    class Sloppy(AComponent[EmptySettings, None, int]):
+        name = "sloppy"
+
+        @tool(icons=["https://example.com/i.png"])  # type: ignore[list-item]
+        @invocable
+        async def one(self) -> int:
+            return 1
+
+    with pytest.raises(FrameworkError, match=r"tool 'sloppy__one' has icon\(s\) that are not warpweft.mcp.Icon"):
+        build_server(app_with(Sloppy))
+    with pytest.raises(FrameworkError, match=r"the server has icon\(s\)"):
+        build_server(app_with(Search), icons=[{"src": "https://example.com/i.png"}])  # type: ignore[list-item]
+
+
+def test_server_icons_may_be_none() -> None:
+    build_server(app_with(Search), icons=None)  # an optional setting forwarded unset
+
+
+# --- server metadata -----------------------------------------------------------
+
+METADATA: dict[str, Any] = {
+    "name": "billing",
+    "version": "2.3",
+    "title": "Billing",
+    "description": "Invoices and refunds.",
+    "instructions": "Look the account up with billing__lookup before any refund.",
+    "website_url": "https://example.com/billing",
+    "icons": [Icon("https://example.com/billing.svg", mime_type="image/svg+xml", sizes=["any"], theme="dark")],
+}
+
+# "auto" negotiates 2026-07-28 through a real server/discover (a pinned mode synthesizes one).
+ERAS = [pytest.param("legacy", id="handshake"), pytest.param("auto", id="per-request")]
+
+
+@pytest.mark.parametrize("mode", ERAS)
+async def test_server_metadata_reaches_the_client(mode: str) -> None:
+    async with connected_as(app_with(Search), mode, **METADATA) as client:
+        assert client.instructions == METADATA["instructions"]
+        info = client.server_info
+    assert (info.name, info.version, info.title) == ("billing", "2.3", "Billing")
+    assert (info.description, info.website_url) == ("Invoices and refunds.", "https://example.com/billing")
+    assert info.icons == [
+        mt.Icon(src="https://example.com/billing.svg", mime_type="image/svg+xml", sizes=["any"], theme="dark")
+    ]
+
+
+@pytest.mark.parametrize("mode", ERAS)
+async def test_server_metadata_defaults_to_the_bare_identity(mode: str) -> None:
+    async with connected_as(app_with(Search), mode) as client:
+        assert client.instructions is None
+        info = client.server_info
+    assert (info.name, info.version) == ("warpweft", "0")
+    assert (info.title, info.description, info.website_url, info.icons) == (None, None, None, None)
 
 
 async def test_object_return_advertises_output_schema(connect) -> None:

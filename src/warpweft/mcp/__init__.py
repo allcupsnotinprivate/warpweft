@@ -9,7 +9,7 @@ can carry tool metadata whether or not the SDK is installed.
 
 from typing import TYPE_CHECKING, Any
 
-from .tool import ToolMeta, is_tool, tool
+from .tool import Icon, ToolMeta, is_tool, tool
 
 if TYPE_CHECKING:
     from .http import MCPHttpApp, asgi_app, header_binder, run_http
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AxisBinder",
+    "Icon",
     "InMemoryTaskStore",
     "MCPHttpApp",
     "ServerOptions",

@@ -9,7 +9,7 @@ from warpweft import Action, ActionParams, App, EmptySettings, Provider
 from warpweft.core.component import AComponent, describe, invocable
 from warpweft.core.composition import Registry
 from warpweft.core.errors import ConfigurationError, FrameworkError, TransientError
-from warpweft.mcp import collect_tools, tool
+from warpweft.mcp import Icon, build_server, collect_tools, tool
 
 pytestmark = [pytest.mark.unit, pytest.mark.anyio]
 
@@ -196,6 +196,31 @@ def test_action_background_flag_reaches_the_tool_meta() -> None:
 
     (binding,) = collect_tools(app_with(Crunch))
     assert binding.meta.background is True
+
+
+def test_action_icons_reach_the_tool_meta() -> None:
+    icon = Icon("https://example.com/crunch.png")
+
+    class Crunch(Action[EmptySettings, Ping, int]):
+        icons = [icon]
+
+        async def execute(self, params: Ping) -> int:
+            return params.value
+
+    (binding,) = collect_tools(app_with(Crunch))
+    assert binding.meta.icons == (icon,)
+
+
+def test_action_icons_of_the_wrong_type_fail_at_build() -> None:
+    # An action that already used `icons` for something else now feeds the tool.
+    class Legacy(Action[EmptySettings, Ping, int]):
+        icons = ["billing.svg"]  # type: ignore[list-item]
+
+        async def execute(self, params: Ping) -> int:
+            return params.value
+
+    with pytest.raises(FrameworkError, match=r"tool 'legacy__execute' has icon\(s\)"):
+        build_server(app_with(Legacy))
 
 
 def test_action_is_foreground_by_default() -> None:

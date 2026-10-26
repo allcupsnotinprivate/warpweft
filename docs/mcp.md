@@ -27,9 +27,10 @@ Exposure is opt-in: only `@tool`-marked invocables become tools, so health
 checks and internal helpers stay private. `@tool` accepts a `name`/`title`
 override, a `description` (else the method docstring is used), the MCP
 annotation hints `read_only`, `destructive`, `idempotent`, `open_world`,
-free-form `tags` used to [filter](#filtering) which tools a server exposes, and
-`background=True` for [long-running tools](#background-long-running-tools). A
-`@tool` on a method that is not `@invocable` is rejected when the server is
+free-form `tags` used to [filter](#filtering) which tools a server exposes,
+`background=True` for [long-running tools](#background-long-running-tools), and
+`icons` clients show next to the tool (see [server metadata](#server-metadata)).
+A `@tool` on a method that is not `@invocable` is rejected when the server is
 built.
 
 An [action](actions.md) is marked automatically - its `execute` is a tool by
@@ -102,6 +103,47 @@ multi-round-trip instead and works in every mode. Today this matters for
 `run_http` runs on asyncio only, because uvicorn does. Under trio, serve
 `asgi_app(app)` with hypercorn.
 
+### Server metadata
+
+Every entry point takes the same `ServerOptions` keywords. Besides the tool
+filters they carry the server's identity, as a client shows it:
+
+```python
+from warpweft.mcp import Icon, asgi_app
+
+mcp = asgi_app(
+    app,
+    name="billing",
+    version="2.3.0",
+    title="Billing",
+    description="Invoices and refunds for one tenant.",
+    instructions="Look an account up with billing__lookup before any refund.",
+    website_url="https://example.com/billing",
+    icons=[Icon("https://example.com/billing.svg", mime_type="image/svg+xml", sizes=["any"])],
+)
+```
+
+| Option | What the client sees |
+| --- | --- |
+| `name`, `version` | `serverInfo.name` / `.version` (defaults `warpweft` / `0`) |
+| `title`, `description` | a human-friendly name and a one-line description in the UI |
+| `instructions` | guidance for the model, returned with `initialize` and `server/discover` |
+| `website_url` | a link to the server's website |
+| `icons` | the server's icons |
+
+`instructions` is the one field written for the model: clients typically put it
+in the system prompt. Say when to use which tool, in which order, and what to
+avoid; do not repeat the tool descriptions, the model has those too.
+
+An `Icon` takes an `https:` URL or a `data:` URI with the image inline, an
+optional `mime_type`, `sizes` (`"48x48"`, or `"any"` for a scalable image) and a
+`theme` (`"light"` or `"dark"`). The MCP spec has clients reject every other
+scheme, `http:` included, so `Icon` rejects one when it is defined. On the
+2026-07-28 protocol the SDK stamps `serverInfo`, icons included, into `_meta` of
+every response: give the server `https:` URLs and keep `data:` URIs for tool
+icons, which travel once per `tools/list`. `@tool(icons=[...])` and an action's
+`icons` attribute put icons on a tool.
+
 ### Command line
 
 The `warpweft` command serves an app without a launcher script:
@@ -110,9 +152,14 @@ The `warpweft` command serves an app without a launcher script:
 warpweft serve --app myapp.main:app                       # stdio
 warpweft serve --app myapp.main:app --transport http --port 8000
 warpweft serve --app myapp.main:app --tag public --confirm-destructive
+warpweft serve --app myapp.main:app --title Billing --instructions-file mcp-instructions.md
 ```
 
 `--tag`, `--include` and `--exclude` take one value each and can be repeated.
+`--name`, `--server-version`, `--title`, `--description`, `--website-url` and
+`--instructions-file` set the [server metadata](#server-metadata); the
+instructions come from a file, because they are usually several lines, and the
+file must not be empty.
 `warpweft serve --help` lists the HTTP options.
 
 ### Custom transports
