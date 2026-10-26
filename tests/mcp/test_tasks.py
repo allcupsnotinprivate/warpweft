@@ -11,6 +11,7 @@ from typing import Any
 
 import anyio
 import mcp.types as mt
+from mcp_types import TaskStatus
 from pydantic import BaseModel
 import pytest
 
@@ -19,7 +20,7 @@ from warpweft.core.component import AComponent, EmptySettings, invocable
 from warpweft.core.composition import Registry
 from warpweft.core.context import report_progress
 from warpweft.core.errors import FrameworkError, PermanentError
-from warpweft.mcp import build_server, task_runner, tool
+from warpweft.mcp import build_server, open_server, task_runner, tool
 from warpweft.mcp.tasks import DEFAULT_TTL_MS, InMemoryTaskStore, TaskRecord
 from warpweft.runtime import App
 
@@ -44,12 +45,14 @@ def err(text: str = "boom") -> mt.CallToolResult:
     return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)], is_error=True)
 
 
-def record(clock: ManualClock, task_id: str = "t1", *, ttl_ms: int | None = DEFAULT_TTL_MS) -> TaskRecord:
+def record(
+    clock: ManualClock, task_id: str = "t1", *, ttl_ms: int | None = DEFAULT_TTL_MS, status: TaskStatus = "working"
+) -> TaskRecord:
     now = clock.now()
     return TaskRecord(
         task_id=task_id,
         tool="demo",
-        status="working",
+        status=status,
         created_at=now,
         last_updated_at=now,
         ttl_ms=ttl_ms,
@@ -93,8 +96,29 @@ async def test_update_unknown_is_a_noop() -> None:
 async def test_expired_record_is_dropped_on_access() -> None:
     clock = ManualClock()
     store = InMemoryTaskStore(clock)
-    await store.create(record(clock, ttl_ms=1000))
+    await store.create(record(clock, ttl_ms=1000, status="completed"))
     clock.advance(2.0)
+    assert await store.get("t1") is None
+
+
+async def test_a_running_task_never_expires() -> None:
+    # A slow job must not lose its record (and so its result) while it runs.
+    clock = ManualClock()
+    store = InMemoryTaskStore(clock)
+    await store.create(record(clock, ttl_ms=1000))
+    clock.advance(10.0)
+    assert await store.get("t1") is not None
+
+
+async def test_retention_counts_from_when_the_task_settled() -> None:
+    clock = ManualClock()
+    store = InMemoryTaskStore(clock)
+    await store.create(record(clock, ttl_ms=1000))
+    clock.advance(10.0)  # ran far longer than the TTL
+    await store.update("t1", status="completed", result=ok())
+    clock.advance(0.5)
+    assert await store.get("t1") is not None  # still within retention after settling
+    clock.advance(1.0)
     assert await store.get("t1") is None
 
 
@@ -220,9 +244,9 @@ async def test_cancel_before_the_job_starts_is_honored() -> None:
 async def test_update_does_not_resurrect_an_expired_record() -> None:
     clock = ManualClock()
     store = InMemoryTaskStore(clock)
-    await store.create(record(clock, ttl_ms=1000))
+    await store.create(record(clock, ttl_ms=1000, status="completed"))
     clock.advance(2.0)  # past TTL
-    # A late progress update must not un-expire the record.
+    # A late update must not un-expire the record.
     await store.update("t1", status="working", status_message="late")
     assert await store.get("t1") is None
 
@@ -520,6 +544,12 @@ async def test_reserved_tool_name_is_rejected() -> None:
     async with task_runner() as runner:
         with pytest.raises(FrameworkError, match="reserved for background task tools"):
             build_server(app_with(Clash), runner=runner)
+
+    # open_server validates before starting anything, so the error is not
+    # wrapped in the task runner's exception group (the CLI reports it cleanly).
+    with pytest.raises(FrameworkError, match="reserved for background task tools"):
+        async with open_server(app_with(Clash)):
+            pass
 
 
 async def test_confirm_destructive_gates_a_background_submit(connect) -> None:

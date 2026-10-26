@@ -1,10 +1,11 @@
-"""The ``warpweft`` command line: inspect and validate an app without running it.
+"""The ``warpweft`` command line: inspect, validate and serve an app.
 
 Every command loads an `~warpweft.runtime.app.App` by import path
-(``module:attribute``, like uvicorn) and reads it offline - the container is
-built and validated but never started, so no component, client or pool is
-touched. That makes ``warpweft check`` safe in CI and the inspection commands
-safe against production config.
+(``module:attribute``, like uvicorn). The inspection commands read it offline -
+the container is built and validated but never started, so no component,
+client or pool is touched. That makes ``warpweft check`` safe in CI and the
+inspection commands safe against production config. Only ``serve`` starts the
+app, to expose its tools over MCP (needs the ``mcp`` extra).
 
     warpweft check   --app myapp.main:app        # validate config + dependency graph
     warpweft list    --app myapp.main:app        # registered components
@@ -12,17 +13,21 @@ safe against production config.
     warpweft explain <component> <method> --app ...   # effective chain + provenance
     warpweft config  <component> --app ...        # resolved config (secrets masked)
     warpweft schema  <component> --app ...        # JSON Schema of the config model
+    warpweft serve   --app ... [--transport http]  # serve @tool invocables over MCP
 
 The ``--app`` value may also come from the ``WARPWEFT_APP`` environment variable.
 Pass ``--json`` for machine-readable output.
 """
 
 import argparse
+import functools
 import importlib
 import json
 import os
 import sys
 from typing import Any
+
+import anyio
 
 from warpweft.core.errors import FrameworkError
 
@@ -161,6 +166,48 @@ def _cmd_schema(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+#: ``serve`` flags that only mean something for ``--transport http``, with their
+#: defaults. argparse leaves them ``None``, so a flag the user passed is visible.
+_HTTP_DEFAULTS: dict[str, Any] = {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "path": "/mcp",
+    "stateless": False,
+    "json_response": False,
+}
+
+
+def _cmd_serve(app: App, args: argparse.Namespace) -> int:
+    given = [name for name in _HTTP_DEFAULTS if getattr(args, name) is not None]
+    if args.transport == "stdio" and given:
+        flags = ", ".join("--" + name.replace("_", "-") for name in given)
+        raise SystemExit(f"error: {flags} only apply to --transport http")
+    options: dict[str, Any] = {
+        "tags": args.tag,
+        "include": args.include,
+        "exclude": args.exclude,
+        "confirm_destructive": args.confirm_destructive,
+        "background": not args.no_background,
+    }
+    if args.transport == "stdio":
+        # stdout is the protocol channel: nothing else may be printed to it.
+        anyio.run(functools.partial(_mcp_entry_point("run_stdio"), app, **options))
+    else:
+        http = _HTTP_DEFAULTS | {name: getattr(args, name) for name in given}
+        anyio.run(functools.partial(_mcp_entry_point("run_http"), app, **http, **options))
+    return 0
+
+
+def _mcp_entry_point(name: str) -> Any:
+    """``warpweft.mcp.<name>``, importing only that transport - or exit asking for the extra."""
+    try:
+        import warpweft.mcp
+
+        return getattr(warpweft.mcp, name)
+    except ModuleNotFoundError as exc:
+        raise SystemExit(f"error: 'serve' needs the mcp extra (pip install 'warpweft[mcp]'): {exc}") from exc
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warpweft", description="Inspect and validate a warpweft app.")
     parser.add_argument(
@@ -186,6 +233,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     schema = sub.add_parser("schema", help="Print the JSON Schema of a component's config.")
     schema.add_argument("component")
+
+    serve = sub.add_parser("serve", help="Start the app and serve its @tool invocables over MCP.")
+    serve.add_argument("--transport", choices=["stdio", "http"], default="stdio", help="Default: stdio.")
+    serve.add_argument("--host", help="HTTP bind address. Default: 127.0.0.1.")
+    serve.add_argument("--port", type=int, help="HTTP port. Default: 8000.")
+    serve.add_argument("--path", help="HTTP endpoint path. Default: /mcp.")
+    serve.add_argument("--stateless", action="store_true", default=None, help="HTTP: no per-client sessions.")
+    serve.add_argument(
+        "--json-response", action="store_true", default=None, help="HTTP: JSON bodies instead of SSE streams."
+    )
+    serve.add_argument("--tag", action="append", help="Serve only tools with this tag (repeatable).")
+    serve.add_argument("--include", action="append", help="Serve only tools matching this glob (repeatable).")
+    serve.add_argument("--exclude", action="append", help="Drop tools matching this glob (repeatable).")
+    serve.add_argument(
+        "--confirm-destructive", action="store_true", help="Ask the user before running a destructive tool."
+    )
+    serve.add_argument("--no-background", action="store_true", help="Serve without a background task runner.")
     return parser
 
 
@@ -196,6 +260,7 @@ _COMMANDS = {
     "explain": _cmd_explain,
     "config": _cmd_config,
     "schema": _cmd_schema,
+    "serve": _cmd_serve,
 }
 
 

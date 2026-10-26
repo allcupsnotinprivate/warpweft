@@ -162,8 +162,10 @@ Pass a `shutdown` event to drive it from your own code instead of signals.
 
 Warpweft provides a `warpweft` command that inspects and
 validates an app **offline** - it builds and validates the container but never
-starts it, so no component, client or pool is touched. Point it at your App by
-import path (`module:attribute`, like uvicorn), or set `WARPWEFT_APP`:
+starts it, so no component, client or pool is touched. The one exception is
+`serve`, which starts the app to [serve its tools over MCP](mcp.md#command-line).
+Point it at your App by import path (`module:attribute`, like uvicorn), or set
+`WARPWEFT_APP`:
 
 ```
 warpweft check   --app myapp.main:app     # validate config + graph (exit 1 on error) - for CI
@@ -172,6 +174,7 @@ warpweft describe [component] --app ...   # metadata, invocables, effective chai
 warpweft explain <component> <method>     # a method's chain + where each setting came from
 warpweft config  <component> --app ...    # resolved config, secrets masked
 warpweft schema  <component> --app ...    # JSON Schema of the config model (editor autocomplete)
+warpweft serve   --app ... [--transport http]  # start the app, serve its tools over MCP (mcp extra)
 ```
 
 `--json` gives machine-readable output. `warpweft check` is the CI gate: it

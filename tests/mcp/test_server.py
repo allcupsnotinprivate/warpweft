@@ -3,6 +3,7 @@
 from typing import Any
 
 import anyio
+from mcp import Client
 import mcp.types as mt
 from pydantic import BaseModel, SecretStr
 import pytest
@@ -20,7 +21,7 @@ from warpweft.core.errors import (
     TransientError,
 )
 from warpweft.core.formats import Ipv4
-from warpweft.mcp import collect_tools, tool
+from warpweft.mcp import build_server, collect_tools, tool
 from warpweft.mcp.errors import error_result
 from warpweft.runtime import App
 
@@ -571,6 +572,25 @@ async def test_declined_destructive_tool_is_not_executed(connect) -> None:
     assert result.is_error is True
     assert result.meta["warpweft.error"] == "declined"
     assert ran["n"] == 0
+
+
+@pytest.mark.parametrize(
+    ("callback", "expected_error", "expected_runs"),
+    [pytest.param(_accept, None, 1, id="accept"), pytest.param(_decline, "declined", 0, id="decline")],
+)
+async def test_per_request_protocol_confirms_by_round_trip(
+    callback: Any, expected_error: str | None, expected_runs: int
+) -> None:
+    # The 2026-07-28 protocol (the SDK client's default) has no mid-call back
+    # channel: the question rides an InputRequiredResult and the retried call.
+    Purge, ran = purge_component()
+    app = app_with(Purge)
+    async with app.run():
+        server = build_server(app, confirm_destructive=True)
+        async with Client(server, mode="2026-07-28", elicitation_callback=callback) as client:
+            result = await client.call_tool("purge__run", {})
+    assert (result.meta or {}).get("warpweft.error") == expected_error
+    assert ran["n"] == expected_runs
 
 
 async def test_destructive_confirmation_fails_closed_without_capability(connect) -> None:
