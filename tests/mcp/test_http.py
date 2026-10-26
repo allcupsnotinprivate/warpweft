@@ -11,6 +11,7 @@ import contextlib
 import socket
 from typing import Any
 
+from _support.mcp_tasks import TasksClient
 import anyio
 import httpx2
 from mcp import Client
@@ -94,12 +95,14 @@ async def http_client(
     mode: str = "auto",
     headers: dict[str, str] | None = None,
     elicitation_callback: Any = None,
+    extensions: list[Any] | None = None,
 ) -> AsyncIterator[Client]:
     """A connected SDK client talking to ``asgi`` in-process (lifespan not entered here)."""
     transport = httpx2.ASGITransport(app=asgi)
     async with httpx2.AsyncClient(transport=transport, base_url=BASE_URL, headers=headers or {}) as http:
         mcp_transport = streamable_http_client(url, http_client=http)
-        async with Client(mcp_transport, mode=mode, elicitation_callback=elicitation_callback) as client:
+        client = Client(mcp_transport, mode=mode, elicitation_callback=elicitation_callback, extensions=extensions)
+        async with client:
             yield client
 
 
@@ -172,6 +175,17 @@ async def test_background_tools_submit_and_poll() -> None:
                 await anyio.sleep(0.01)
         result = await client.call_tool("task_result", {"task_id": task_id})
         assert result.structured_content == {"result": 42}
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_background_tools_run_as_native_tasks(transport: dict[str, Any]) -> None:
+    # A client with the tasks extension gets a task handle and polls tasks/get
+    # (with the Mcp-Name routing header) - stateless included.
+    tasks = TasksClient()
+    async with serving(asgi_app(echo_app(), **transport), mode="2026-07-28", extensions=[tasks]) as client:
+        result = await client.call_tool("echo__job", {"n": 21})
+    assert result.structured_content == {"result": 42}
+    assert len(tasks.handles) == 1
 
 
 # --- per-request axes from headers ---------------------------------------------

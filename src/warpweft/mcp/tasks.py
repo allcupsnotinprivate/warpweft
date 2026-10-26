@@ -10,13 +10,14 @@ through ``container.invoke`` - the full policy chain and telemetry - so a task
 is just a call whose result is retained instead of returned inline. Persistence
 beyond a single process (surviving a restart) is the store's concern.
 
-This substrate is transport-agnostic. warpweft consumes it in ``server.py`` to
-expose ``@tool(background=True)`` operations as plain ``tools/call`` tools - a
-*submit* that returns a ``task_id`` plus shared ``task_status`` / ``task_result``
-/ ``task_cancel`` tools - so long-running work needs no special MCP transport
-and works over stdio today. (The native MCP task *wire* feature, which would let
-a client augment ``tools/call`` directly, only exists on the modern
-``2026-07-28`` streamable-HTTP transport and is deliberately not used.)
+This substrate is transport-agnostic, and warpweft exposes it two ways:
+
+- ``server.py`` serves ``@tool(background=True)`` operations as plain
+  ``tools/call`` tools - a *submit* that returns a ``task_id`` plus shared
+  ``task_status`` / ``task_result`` / ``task_cancel`` tools - which works with
+  every client and transport.
+- ``tasks_extension.py`` serves the same tasks natively over the MCP Tasks
+  extension (2026-07-28) to clients that declare it.
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable

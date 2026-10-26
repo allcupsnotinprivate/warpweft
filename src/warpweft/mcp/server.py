@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 import inspect
 import json
-from typing import Any, TypedDict, Unpack
+from typing import Any, TypedDict, Unpack, cast
 
 from mcp.server.lowlevel.server import Server
 from mcp.server.stdio import stdio_server
@@ -34,7 +34,9 @@ from warpweft.runtime import App, AxisHandle
 
 from .errors import error_result
 from .schema import tool_input_schema
-from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRunner, TaskStatusView, status_view, task_runner
+from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRecord, TaskRunner, TaskStatusView, status_view, task_runner
+from .tasks_extension import create_task_result, supports_native_tasks
+from .tasks_extension import install as install_tasks_extension
 from .tool import ToolMeta, is_tool, tool_meta
 
 #: Derives an axis value (e.g. tenant) from the incoming MCP call - the request
@@ -43,6 +45,11 @@ from .tool import ToolMeta, is_tool, tool_meta
 #: Returning ``None`` leaves the axis unbound (its default/required rule then
 #: applies). Bound around the call so scoped components resolve.
 AxisBinder = Callable[[Any, mt.CallToolRequestParams], str | None]
+
+
+#: What ``tools/call`` answers: a result, a request for user input
+#: (multi-round-trip), or a native task handle (``resultType: "task"``).
+CallToolResponse = mt.CallToolResult | mt.InputRequiredResult | dict[str, Any]
 
 
 class ServerOptions(TypedDict, total=False):
@@ -226,10 +233,16 @@ def _output_contract(binding: ToolBinding) -> tuple[dict[str, Any], bool]:
     return wrapper, True
 
 
-def _describe_tool(cls: type, binding: ToolBinding) -> mt.Tool:
+def _describe_tool(cls: type, binding: ToolBinding, *, native_tasks: bool) -> mt.Tool:
+    """The tool as one client sees it.
+
+    A background tool looks different to a client with native MCP tasks: the
+    task handle is protocol-level, so the tool advertises its real output, as
+    an inline tool would. Any other client sees the plain submit.
+    """
     method = getattr(cls, binding.method)
     description = binding.meta.description or (inspect.getdoc(method) or None)
-    if binding.meta.background:
+    if binding.meta.background and not native_tasks:
         # A background tool is a *submit*: it advertises the op's args as input
         # but returns only a task id; the result is fetched later via task_result.
         note = "Starts a background task and returns a task_id; poll task_status / task_result."
@@ -511,10 +524,12 @@ def build_server(
     task_tools = _task_tool_descriptors(background) if background else []
 
     async def on_list_tools(ctx: Any, params: Any) -> mt.ListToolsResult:
-        tools = [_describe_tool(classes[b.component], b) for b in bindings.values()]
-        return mt.ListToolsResult(tools=tools + task_tools)
+        native = runner is not None and supports_native_tasks(ctx)
+        tools = [_describe_tool(classes[b.component], b, native_tasks=native) for b in bindings.values()]
+        # A native-tasks client polls tasks/get itself: the submit/poll tools are noise to its model.
+        return mt.ListToolsResult(tools=tools if native else tools + task_tools)
 
-    async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> mt.CallToolResult | mt.InputRequiredResult:
+    async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> CallToolResponse:
         if params.name in _RESERVED_NAMES:
             return await _handle_task_tool(runner, params)
 
@@ -551,7 +566,9 @@ def build_server(
                 return error_result(exc)
 
             if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
-                return await _submit(app, runner, binding, kwargs)
+                native = supports_native_tasks(ctx)
+                record = await _start_task(app, runner, binding, kwargs, native=native)
+                return create_task_result(record) if native else _submit_result(record)
 
             async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
                 # Best-effort: a failed notification must never fail the call.
@@ -571,15 +588,27 @@ def build_server(
 
             return _success_result(binding, outcome)
 
-    return Server(name, version=version, on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+    # A task handle is a dict (the extension's ``resultType: "task"`` shape),
+    # which the SDK serves but its handler signature does not list.
+    server = Server(name, version=version, on_list_tools=on_list_tools, on_call_tool=cast(Any, on_call_tool))
+    if background and runner is not None:
+        install_tasks_extension(server, runner)
+    return server
 
 
-async def _submit(app: App, runner: TaskRunner, binding: ToolBinding, kwargs: dict[str, Any]) -> mt.CallToolResult:
-    """Start a background job and return its task id immediately."""
+async def _start_task(
+    app: App, runner: TaskRunner, binding: ToolBinding, kwargs: dict[str, Any], *, native: bool
+) -> TaskRecord:
+    """Start a background job; the record is durable before this returns.
+
+    The stored result has the shape its poller expects: for a native task, what
+    the call would have returned inline (``tasks/get`` hands it back as is); for
+    a submit, the ``{"result": ...}`` wrapping that ``task_result`` advertises.
+    """
 
     async def job(task_id: str) -> mt.CallToolResult:
-        # Progress becomes status updates on the task record, since the submit
-        # request has already been answered with the id.
+        # Progress becomes status updates on the task record, since the call
+        # has already been answered with the task.
         async def to_status(progress: float, total: float | None, message: str | None) -> None:
             with contextlib.suppress(Exception):
                 await runner.store.update(task_id, status="working", status_message=message)
@@ -589,15 +618,16 @@ async def _submit(app: App, runner: TaskRunner, binding: ToolBinding, kwargs: di
                 outcome = await app.container.invoke(binding.component, binding.method, **kwargs)
         except Exception as exc:
             return error_result(exc)
-        # Always wrap: task_result advertises one union schema over {"result": ...}.
-        return _result(binding, outcome, wrap=True)
+        return _success_result(binding, outcome) if native else _result(binding, outcome, wrap=True)
 
-    record = await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS)
+    return await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS)
+
+
+def _submit_result(record: TaskRecord) -> mt.CallToolResult:
+    """A plain submit's answer: just the task id."""
     task_id = {"task_id": record.task_id}
-    return mt.CallToolResult(
-        content=[mt.TextContent(type="text", text=json.dumps(task_id))],
-        structured_content=task_id,
-    )
+    text = mt.TextContent(type="text", text=json.dumps(task_id))
+    return mt.CallToolResult(content=[text], structured_content=task_id)
 
 
 async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolRequestParams) -> mt.CallToolResult:

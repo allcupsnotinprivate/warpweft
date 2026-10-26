@@ -243,11 +243,34 @@ When at least one background tool is served, three shared tools appear:
 - **`task_cancel(task_id)`** - requests cancellation; the job's policy chain
   unwinds and the task settles to `cancelled`.
 
-This is all plain `tools/call` returning `CallToolResult`, so it needs no
-special transport - it works over stdio today. Everything else about a tool
-still applies: arguments are validated before submit, `report_progress` becomes
-task status (not client notifications, since the request already returned), and
+This is all plain `tools/call` returning `CallToolResult`, so it works with
+every client and transport. Everything else about a tool still applies:
+arguments are validated before submit, `report_progress` becomes task status
+(not client notifications, since the request already returned), and
 `confirm_destructive` gates the submit so a task never starts without consent.
+
+### Native MCP tasks
+
+A client that supports the [MCP Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks)
+(`io.modelcontextprotocol/tasks`, on the 2026-07-28 protocol) gets the same
+background tools natively, with no change to the component. The server
+advertises the extension whenever a background tool is served, and for a client
+that declares it:
+
+- `tools/list` shows a background tool as an ordinary tool with its real output
+  schema; the `task_*` tools are left out.
+- `tools/call` answers with a task handle (`resultType: "task"`) instead of a
+  `task_id` payload.
+- The client polls `tasks/get` and receives the tool's own result once the task
+  completes - exactly what an inline call would have returned. `tasks/cancel`
+  cancels the job.
+
+Native tasks and the `task_*` tools share one runner and store. A tool error
+completes the task with an `isError` result, as the extension requires;
+`failed` is reserved for a job that crashed without a result. Two optional
+parts of the extension are not implemented: `input_required` tasks (a job never
+asks for input mid-flight, so `tasks/update` accepts and ignores responses) and
+`notifications/tasks` push updates (clients poll).
 
 `run_stdio` opens an in-memory task runner by default (`background=False` serves
 inline-only). For programmatic use, pass your own store and runner:
