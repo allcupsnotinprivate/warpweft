@@ -38,6 +38,12 @@ rarely write `@tool` yourself.
 
 ## Serving
 
+The same tools can be served over two transports. Tool behaviour does not
+depend on the transport: both run the same handlers, policy chain and
+telemetry.
+
+### stdio
+
 ```python
 from warpweft.mcp import run_stdio
 
@@ -45,8 +51,74 @@ anyio.run(run_stdio, app)  # local host (Claude Desktop, an IDE)
 ```
 
 `run_stdio` starts the app, serves its tools over stdio, and stops the app when
-the stream closes. For programmatic use (or a future HTTP transport),
-`build_server(app)` returns a transport-agnostic MCP server.
+the stream closes. This is the transport for a host that launches the server as
+a subprocess.
+
+### Streamable HTTP
+
+For a remote or shared deployment, serve the tools over HTTP:
+
+```python
+from warpweft.mcp import run_http
+
+anyio.run(run_http, app)  # http://127.0.0.1:8000/mcp, served by uvicorn
+```
+
+`run_http` is a thin wrapper for the common case. `asgi_app(app)` returns the
+underlying ASGI application, for any ASGI server (uvicorn, hypercorn) or for
+mounting into an existing Starlette/FastAPI app:
+
+```python
+from warpweft.mcp import asgi_app
+
+mcp = asgi_app(app, path="/mcp")
+
+api = FastAPI(lifespan=mcp.lifespan)  # starts the app - use instead of app.lifespan
+api.mount("/", mcp)
+```
+
+Its lifespan starts the app, the background task runner and the MCP session
+manager together, so the app runs exactly while requests can reach it. Starlette
+does not run the lifespan of a mounted app, which is why the host must take
+`mcp.lifespan`. A request that arrives outside the lifespan gets `503`.
+
+The HTTP plumbing comes from the mcp SDK and is configured through `asgi_app`:
+
+| Option | Effect |
+| --- | --- |
+| `stateless=True` | no per-client session: every request stands alone, so it scales across workers |
+| `json_response=True` | a single JSON body per response instead of an SSE stream |
+| `host` | the address clients use; for a loopback host DNS-rebinding protection turns on automatically (`transport_security` configures it explicitly) |
+| `auth`, `token_verifier` | bearer-token auth as an OAuth resource server |
+| `session_idle_timeout`, `max_sessions` | limits for stateful sessions |
+
+Both the `initialize` handshake protocol and the 2026-07-28 per-request
+protocol are served; the client chooses. Some features need the server to send
+a request back to the client mid-call, which only a stateful session with SSE
+responses on the handshake protocol can carry. Today that affects
+[destructive-tool confirmation](#confirming-destructive-tools).
+
+`run_http` runs on asyncio only, because uvicorn does. Under trio, serve
+`asgi_app(app)` with hypercorn.
+
+### Command line
+
+The `warpweft` command serves an app without a launcher script:
+
+```
+warpweft serve --app myapp.main:app                       # stdio
+warpweft serve --app myapp.main:app --transport http --port 8000
+warpweft serve --app myapp.main:app --tag public --confirm-destructive
+```
+
+`--tag`, `--include` and `--exclude` take one value each and can be repeated.
+`warpweft serve --help` lists the HTTP options.
+
+### Custom transports
+
+`build_server(app)` returns a transport-agnostic MCP server. `open_server(app)`
+wraps it in the shared lifecycle - start the app, open the task runner, build
+the server - for a transport adapter of your own.
 
 ## Filtering
 
@@ -192,6 +264,9 @@ component tool claiming one, or a `background=True` tool served without a
 runner, raises a `FrameworkError` at build time. The default in-memory store
 keeps task state and results for the process lifetime only - a deployment that
 must survive a restart supplies its own `TaskStore` (Redis, Postgres, ...).
+The same applies to an HTTP deployment with several workers: each worker has
+its own in-memory store, so a poll can land on a worker that never saw the
+task. Run one worker, or supply a shared store.
 
 ## Per-request axes (tenancy)
 
@@ -206,16 +281,27 @@ tenant = app.axis("tenant")  # or app.axis("tenant", default="public")
 
 server = build_server(
     app,
-    axis_binders={tenant: lambda ctx, params: ctx.headers.get("x-tenant")},
+    axis_binders={tenant: lambda ctx, params: (params.arguments or {}).get("tenant")},
 )
+```
+
+Over HTTP, the usual source is a request header. `header_binder` reads one, case
+insensitively, and yields `None` on stdio, where there are no headers:
+
+```python
+from warpweft.mcp import asgi_app, header_binder
+
+asgi_app(app, axis_binders={tenant: header_binder("x-tenant")})
 ```
 
 The value is bound (via the axis's contextvar) around the call, so a scoped
 component resolves the right slice; returning `None` leaves the axis to its
 default (or, for a required axis, fails the call). The binder receives the
-request context `ctx` (session, headers, `_meta`) and the call `params` (tool
-name and arguments), so tenancy can come from a header, the auth context, or a
-tool argument. A background submit binds the axis across `runner.start`, so the
+request context `ctx` and the call `params` (tool name and arguments), so
+tenancy can come from a header, the auth context, or a tool argument. Over
+HTTP, `ctx.request` is the Starlette request; on stdio it is `None`. With
+`token_verifier` set, the verified token is available through the SDK's
+`get_access_token()`. A background submit binds the axis across `runner.start`, so the
 [background job](#background-long-running-tools) inherits the submit-time value.
 A binder that raises becomes a tool error, never a transport failure.
 
@@ -235,7 +321,10 @@ executing, the server sends an MCP elicitation that the client presents to
 the user. Only an explicit accept runs the tool - decline or cancel returns a
 tool error (`warpweft.error: "declined"`) without executing anything. The
 gate fails closed: a client that does not support elicitation gets
-`confirmation_unsupported` instead of an unconfirmed execution. Confirmation
+`confirmation_unsupported` instead of an unconfirmed execution. So does a
+connection that cannot carry the elicitation request: over HTTP that is
+anything but a stateful session with SSE responses on the handshake protocol
+(see [Streamable HTTP](#streamable-http)). Confirmation
 happens after argument validation and never applies to non-destructive
 tools.
 

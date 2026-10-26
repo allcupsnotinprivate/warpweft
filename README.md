@@ -41,7 +41,7 @@ editing config - environment, TOML or YAML - never the call site.
 - **Ergonomic units** - model a single callable operation as an `Action`, or
   shared infrastructure as a `Provider`, both built on the same core.
 - **LLM-ready** - expose invocables as [Model Context Protocol](https://modelcontextprotocol.io/)
-  tools with flat, typed schemas.
+  tools with flat, typed schemas, over stdio or Streamable HTTP.
 - **Async & typed** - built on [anyio](https://anyio.readthedocs.io/) (runs on
   asyncio and trio) and checked with `mypy --strict` throughout.
 

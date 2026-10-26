@@ -1,9 +1,10 @@
 """Build an MCP server from an app's ``@tool`` invocables.
 
-Discovery, the ``list_tools`` / ``call_tool`` handlers and the transport
-adapters live here. Tool logic is transport-agnostic: `build_server`
-returns a wired server; `run_stdio` drives it over stdio (a local
-subprocess host such as Claude Desktop or an IDE).
+Discovery and the ``list_tools`` / ``call_tool`` handlers live here. Tool
+logic is transport-agnostic: `build_server` returns a wired server; `run_stdio`
+drives it over stdio (a local subprocess host such as Claude Desktop or an IDE)
+and `warpweft.mcp.http` serves it over Streamable HTTP. Both transports share
+`open_server` for the app/task-runner lifecycle.
 
 Each tool is one ``@tool``-marked invocable. A call is routed through
 ``container.invoke``, so it runs the component's full policy chain and
@@ -11,16 +12,17 @@ telemetry; the result is serialized against the invocable's output schema
 (secrets masked) and returned as both structured and text content.
 """
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 import contextlib
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 import inspect
 import json
-from typing import Any
+from typing import Any, TypedDict, Unpack
 
 from mcp.server.lowlevel.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.shared.exceptions import NoBackChannelError
 import mcp.types as mt
 from pydantic import ValidationError
 
@@ -35,10 +37,29 @@ from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRunner, TaskStatusView, status_
 from .tool import ToolMeta, is_tool, tool_meta
 
 #: Derives an axis value (e.g. tenant) from the incoming MCP call - the request
-#: context (``ctx``: session, headers, ``_meta``) and the call params (name,
-#: arguments). Returning ``None`` leaves the axis unbound (its default/required
-#: rule then applies). Bound around the call so scoped components resolve.
+#: context (``ctx``: session, ``meta``, and ``request`` - the HTTP request on
+#: HTTP transports, ``None`` on stdio) and the call params (name, arguments).
+#: Returning ``None`` leaves the axis unbound (its default/required rule then
+#: applies). Bound around the call so scoped components resolve.
 AxisBinder = Callable[[Any, mt.CallToolRequestParams], str | None]
+
+
+class ServerOptions(TypedDict, total=False):
+    """`build_server` options a transport entry point passes through unchanged.
+
+    `run_stdio`, `warpweft.mcp.http.asgi_app` and `warpweft.mcp.http.run_http`
+    accept these as keyword arguments; see `build_server` for their meaning.
+    The task ``runner`` is not here: transports open it themselves.
+    """
+
+    name: str
+    version: str
+    tags: Collection[str] | None
+    include: Collection[str] | None
+    exclude: Collection[str] | None
+    confirm_destructive: bool
+    axis_binders: Mapping[AxisHandle, AxisBinder] | None
+
 
 #: Names of the shared built-in tools that drive background execution. They are
 #: reserved: a component tool may not claim one (checked at build time).
@@ -372,11 +393,20 @@ async def _confirm_destructive(ctx: Any, binding: ToolBinding) -> mt.CallToolRes
             code="confirmation_unsupported",
         )
     label = binding.meta.title or binding.name
-    result = await ctx.session.elicit_form(
-        f"Confirm running '{label}'. This action is marked destructive.",
-        {"type": "object", "properties": {}},
-        related_request_id=ctx.request_id,
-    )
+    try:
+        result = await ctx.session.elicit_form(
+            f"Confirm running '{label}'. This action is marked destructive.",
+            {"type": "object", "properties": {}},
+            related_request_id=ctx.request_id,
+        )
+    except NoBackChannelError:
+        # The client can elicit, but this connection cannot carry a
+        # server-initiated request (stateless HTTP, JSON responses, or the
+        # 2026-07-28 per-request era). Still fail closed, as a tool error.
+        return _refusal(
+            f"tool '{binding.name}' requires user confirmation, but this connection cannot carry an elicitation",
+            code="confirmation_unsupported",
+        )
     if result.action != "accept":
         return _refusal(f"the user declined to run '{binding.name}'", code="declined")
     return None
@@ -407,7 +437,10 @@ def build_server(
     runner: TaskRunner | None = None,
     axis_binders: Mapping[AxisHandle, AxisBinder] | None = None,
 ) -> Server[Any]:
-    """Wire an MCP server exposing the app's tools. The app must be started.
+    """Wire an MCP server exposing the app's tools.
+
+    Building only reads the registry, so the app need not be started yet; it
+    must be running by the time a tool is called (`open_server` handles both).
 
     ``tags``/``include``/``exclude`` narrow which tools are served (see
     `collect_tools`), so one app can back several servers with different
@@ -577,43 +610,39 @@ async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolReques
     return _refusal(f"task '{task_id}' is not finished yet (status: {record.status})", code="not_ready", retryable=True)
 
 
+@contextlib.asynccontextmanager
+async def open_server(
+    app: App, *, background: bool = True, **options: Unpack[ServerOptions]
+) -> AsyncIterator[Server[Any]]:
+    """Start the app (and a task runner) and yield its built MCP server.
+
+    The shared lifecycle of every transport: on exit the task runner is closed
+    first - cancelling outstanding background jobs - and then the app stops.
+    ``background=True`` opens an in-memory task runner so
+    ``@tool(background=True)`` tools can run; ``False`` serves inline-only
+    (such a tool then fails loudly at build).
+    """
+    # Pre-flight the tool filters: a bad filter fails here as a plain error,
+    # before the app starts - not wrapped in the task runner's exception group.
+    collect_tools(app, tags=options.get("tags"), include=options.get("include"), exclude=options.get("exclude"))
+    async with app.run(), _optional_runner(background) as runner:
+        yield build_server(app, runner=runner, **options)
+
+
 async def run_stdio(
-    app: App,
-    *,
-    name: str = "warpweft",
-    version: str = "0",
-    tags: Collection[str] | None = None,
-    include: Collection[str] | None = None,
-    exclude: Collection[str] | None = None,
-    confirm_destructive: bool = False,
-    background: bool = True,
-    axis_binders: Mapping[AxisHandle, AxisBinder] | None = None,
+    app: App, *, background: bool = True, **options: Unpack[ServerOptions]
 ) -> None:  # pragma: no cover - needs real stdio
     """Start the app and serve its tools over stdio until the stream closes.
 
-    ``background=True`` (the default) opens an in-memory task runner so
-    ``@tool(background=True)`` tools can run in the background; set it to
-    ``False`` to serve inline-only (such a tool then fails loudly at build).
-    ``axis_binders`` is passed through to `build_server`.
+    ``background`` is as for `open_server`; the remaining keyword arguments
+    are `ServerOptions`, passed through to `build_server`.
     """
-    async with app.run(), _optional_runner(background) as runner:
-        server = build_server(
-            app,
-            name=name,
-            version=version,
-            tags=tags,
-            include=include,
-            exclude=exclude,
-            confirm_destructive=confirm_destructive,
-            runner=runner,
-            axis_binders=axis_binders,
-        )
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, server.create_initialization_options())
+    async with open_server(app, background=background, **options) as server, stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
 
 
 @contextlib.asynccontextmanager
-async def _optional_runner(enabled: bool) -> Any:
+async def _optional_runner(enabled: bool) -> AsyncIterator[TaskRunner | None]:
     """Yield a `TaskRunner` when ``enabled``, else ``None`` (no nursery opened)."""
     if not enabled:
         yield None
