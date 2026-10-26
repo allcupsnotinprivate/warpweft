@@ -1,10 +1,11 @@
-"""The ``warpweft`` command line: inspect and validate an app without running it.
+"""The ``warpweft`` command line: inspect, validate and serve an app.
 
 Every command loads an `~warpweft.runtime.app.App` by import path
-(``module:attribute``, like uvicorn) and reads it offline - the container is
-built and validated but never started, so no component, client or pool is
-touched. That makes ``warpweft check`` safe in CI and the inspection commands
-safe against production config.
+(``module:attribute``, like uvicorn). The inspection commands read it offline -
+the container is built and validated but never started, so no component,
+client or pool is touched. That makes ``warpweft check`` safe in CI and the
+inspection commands safe against production config. Only ``serve`` starts the
+app, to expose its tools over MCP (needs the ``mcp`` extra).
 
     warpweft check   --app myapp.main:app        # validate config + dependency graph
     warpweft list    --app myapp.main:app        # registered components
@@ -12,17 +13,21 @@ safe against production config.
     warpweft explain <component> <method> --app ...   # effective chain + provenance
     warpweft config  <component> --app ...        # resolved config (secrets masked)
     warpweft schema  <component> --app ...        # JSON Schema of the config model
+    warpweft serve   --app ... [--transport http]  # serve @tool invocables over MCP
 
 The ``--app`` value may also come from the ``WARPWEFT_APP`` environment variable.
 Pass ``--json`` for machine-readable output.
 """
 
 import argparse
+import functools
 import importlib
 import json
 import os
 import sys
 from typing import Any
+
+import anyio
 
 from warpweft.core.errors import FrameworkError
 
@@ -161,6 +166,36 @@ def _cmd_schema(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(app: App, args: argparse.Namespace) -> int:
+    try:
+        from warpweft.mcp import run_http, run_stdio
+    except ModuleNotFoundError as exc:
+        raise SystemExit(f"error: 'serve' needs the mcp extra (pip install 'warpweft[mcp]'): {exc}") from exc
+    options: dict[str, Any] = {
+        "tags": args.tag,
+        "include": args.include,
+        "exclude": args.exclude,
+        "confirm_destructive": args.confirm_destructive,
+        "background": not args.no_background,
+    }
+    if args.transport == "stdio":
+        # stdout is the protocol channel: nothing else may be printed to it.
+        anyio.run(functools.partial(run_stdio, app, **options))
+    else:
+        serve = functools.partial(
+            run_http,
+            app,
+            host=args.host,
+            port=args.port,
+            path=args.path,
+            stateless=args.stateless,
+            json_response=args.json_response,
+            **options,
+        )
+        anyio.run(serve)
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="warpweft", description="Inspect and validate a warpweft app.")
     parser.add_argument(
@@ -186,6 +221,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     schema = sub.add_parser("schema", help="Print the JSON Schema of a component's config.")
     schema.add_argument("component")
+
+    serve = sub.add_parser("serve", help="Start the app and serve its @tool invocables over MCP.")
+    serve.add_argument("--transport", choices=["stdio", "http"], default="stdio", help="Default: stdio.")
+    serve.add_argument("--host", default="127.0.0.1", help="HTTP bind address. Default: 127.0.0.1.")
+    serve.add_argument("--port", type=int, default=8000, help="HTTP port. Default: 8000.")
+    serve.add_argument("--path", default="/mcp", help="HTTP endpoint path. Default: /mcp.")
+    serve.add_argument("--stateless", action="store_true", help="HTTP: no per-client sessions.")
+    serve.add_argument("--json-response", action="store_true", help="HTTP: JSON bodies instead of SSE streams.")
+    serve.add_argument("--tag", action="append", help="Serve only tools with this tag (repeatable).")
+    serve.add_argument("--include", action="append", help="Serve only tools matching this glob (repeatable).")
+    serve.add_argument("--exclude", action="append", help="Drop tools matching this glob (repeatable).")
+    serve.add_argument(
+        "--confirm-destructive", action="store_true", help="Ask the user before running a destructive tool."
+    )
+    serve.add_argument("--no-background", action="store_true", help="Serve without a background task runner.")
     return parser
 
 
@@ -196,6 +246,7 @@ _COMMANDS = {
     "explain": _cmd_explain,
     "config": _cmd_config,
     "schema": _cmd_schema,
+    "serve": _cmd_serve,
 }
 
 
