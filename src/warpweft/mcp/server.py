@@ -53,19 +53,35 @@ CallToolResponse = mt.CallToolResult | mt.InputRequiredResult | dict[str, Any]
 
 
 class ServerOptions(TypedDict, total=False):
-    """`build_server` options a transport entry point passes through unchanged.
+    """What an MCP server serves and how - the one definition of these options.
 
-    `run_stdio`, `warpweft.mcp.http.asgi_app` and `warpweft.mcp.http.run_http`
-    accept these as keyword arguments; see `build_server` for their meaning.
-    The task ``runner`` is not here: transports open it themselves.
+    `build_server` takes them as keyword arguments, and every transport entry
+    point (`open_server`, `run_stdio`, `warpweft.mcp.http.asgi_app`,
+    `warpweft.mcp.http.run_http`) passes them through unchanged. The task
+    ``runner`` is not among them: transports open it themselves.
     """
 
+    #: Server name reported to clients. Default ``"warpweft"``.
     name: str
+    #: Server version reported to clients. Default ``"0"``.
     version: str
+    #: Serve only tools carrying one of these ``@tool`` tags (see `collect_tools`),
+    #: so one app can back several servers - e.g. ``{"public"}`` for an assistant.
     tags: Collection[str] | None
+    #: Serve only tools whose names match one of these globs.
     include: Collection[str] | None
+    #: Drop tools whose names match one of these globs; wins over ``include``.
     exclude: Collection[str] | None
+    #: Gate every ``destructive=True`` tool behind an MCP elicitation: only an
+    #: explicit accept runs it; decline, or a client that cannot be asked, is a
+    #: tool error and the call never happens. Default ``False``.
     confirm_destructive: bool
+    #: Map a state-slicing `AxisHandle` (from ``app.axis(...)``) to a function
+    #: deriving its value from each call - e.g. a ``tenant`` from an
+    #: ``x-tenant`` header (`warpweft.mcp.http.header_binder`) or the auth
+    #: context. The axis is bound around ``invoke`` (for a background submit,
+    #: around ``runner.start``, so the job inherits it); ``None`` from the
+    #: binder leaves the axis to its default/required rule.
     axis_binders: Mapping[AxisHandle, AxisBinder] | None
 
 
@@ -354,14 +370,15 @@ def _serialize(binding: ToolBinding, value: Any) -> Any:
     return binding.spec.output_adapter.dump_python(value, mode="json")
 
 
-def _result(binding: ToolBinding, outcome: Any, *, wrap: bool) -> mt.CallToolResult:
-    """Serialize an invoke outcome into a ``CallToolResult``.
+def _success_result(binding: ToolBinding, outcome: Any) -> mt.CallToolResult:
+    """Serialize an invoke outcome into the tool's ``CallToolResult``.
 
-    Text stays the raw serialization (readable for humans). ``wrap`` controls
-    the structured content: an inline call wraps only when its advertised schema
-    is the ``{"result": ...}`` wrapper (a non-object return), while a background
-    result always wraps so ``task_result`` has one uniform union schema.
+    Text stays the raw serialization (readable for humans). Structured content
+    is wrapped in ``{"result": ...}`` exactly when the advertised schema is the
+    wrapper (a non-object return): the decision follows the schema, not the
+    runtime value, so structured content always conforms.
     """
+    _, wrap = _output_contract(binding)
     serialized = _serialize(binding, outcome.value)
     text = serialized if isinstance(serialized, str) else json.dumps(serialized)
     return mt.CallToolResult(
@@ -369,13 +386,6 @@ def _result(binding: ToolBinding, outcome: Any, *, wrap: bool) -> mt.CallToolRes
         structured_content={"result": serialized} if wrap else serialized,
         meta={"warpweft.source": outcome.source, "warpweft.degraded": outcome.degraded},
     )
-
-
-def _success_result(binding: ToolBinding, outcome: Any) -> mt.CallToolResult:
-    """Build the inline success result; the wrap decision follows the advertised
-    schema, not the runtime value, so structured content always conforms."""
-    _, wrapped = _output_contract(binding)
-    return _result(binding, outcome, wrap=wrapped)
 
 
 def _status_result(view: TaskStatusView) -> mt.CallToolResult:
@@ -464,63 +474,48 @@ def _bind_axes(
             stack.enter_context(handle.use(value))
 
 
-def build_server(
-    app: App,
-    *,
-    name: str = "warpweft",
-    version: str = "0",
-    tags: Collection[str] | None = None,
-    include: Collection[str] | None = None,
-    exclude: Collection[str] | None = None,
-    confirm_destructive: bool = False,
-    runner: TaskRunner | None = None,
-    axis_binders: Mapping[AxisHandle, AxisBinder] | None = None,
-) -> Server[Any]:
-    """Wire an MCP server exposing the app's tools.
+def _served_tools(app: App, options: ServerOptions, *, has_runner: bool) -> dict[str, ToolBinding]:
+    """The tools a server would serve, by name - or a `FrameworkError` saying why it cannot.
 
-    Building only reads the registry, so the app need not be started yet; it
-    must be running by the time a tool is called (`open_server` handles both).
-
-    ``tags``/``include``/``exclude`` narrow which tools are served (see
-    `collect_tools`), so one app can back several servers with different
-    tool sets - e.g. ``tags={"public"}`` for an assistant, no filter for an
-    operator console.
-
-    ``confirm_destructive=True`` gates every ``destructive=True`` tool behind
-    an MCP elicitation: the user must accept before the call runs. Decline
-    (or a client that cannot elicit) is a tool error; the call never happens.
-
-    ``runner`` enables ``@tool(background=True)`` tools: such a tool becomes a
-    non-blocking *submit* (returns a ``task_id``), and the server also exposes
-    the shared ``task_status`` / ``task_result`` / ``task_cancel`` tools. A
-    background tool without a ``runner`` is a `FrameworkError` - the advertised
-    behaviour must be real. Everything here is plain ``tools/call``, so it needs
-    no special transport.
-
-    ``axis_binders`` maps a state-slicing `AxisHandle` (from ``app.axis(...)``)
-    to a function that derives its value from each call - e.g. a ``tenant`` axis
-    bound from an ``x-tenant`` header or the auth context. Each call binds the
-    axis (via the handle's contextvar) around ``invoke`` so scoped components
-    resolve; for a background submit the binding spans ``runner.start`` so the
-    job inherits it. A binder returning ``None`` leaves the axis to its
-    default/required rule. Without this, an axis value must be bound by the host
-    (e.g. ASGI middleware) instead.
+    The whole build-time validation: the filters must select something, no
+    tool may claim a reserved task-tool name, and background tools need a
+    runner. Pure registry reads, so `open_server` runs it before starting
+    anything.
     """
-    binders = dict(axis_binders or {})
-    bindings = {b.name: b for b in collect_tools(app, tags=tags, include=include, exclude=exclude)}
-    classes = {name: app.registry.get(name) for name in app.registry.names()}
+    found = collect_tools(app, tags=options.get("tags"), include=options.get("include"), exclude=options.get("exclude"))
+    bindings = {b.name: b for b in found}
 
     collisions = sorted(bindings.keys() & _RESERVED_NAMES)
     if collisions:
         raise FrameworkError(f"tool name(s) {collisions} are reserved for background task tools")
 
-    background = [b for b in bindings.values() if b.meta.background]
-    if background and runner is None:
-        names = sorted(b.name for b in background)
+    background = sorted(b.name for b in bindings.values() if b.meta.background)
+    if background and not has_runner:
         raise FrameworkError(
-            f"tool(s) {names} are @tool(background=True) but the server has no task runner; "
+            f"tool(s) {background} are @tool(background=True) but the server has no task runner; "
             "pass build_server(..., runner=...) (see warpweft.mcp.tasks.task_runner)"
         )
+    return bindings
+
+
+def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpack[ServerOptions]) -> Server[Any]:
+    """Wire an MCP server exposing the app's tools; ``options`` are `ServerOptions`.
+
+    Building only reads the registry, so the app need not be started yet; it
+    must be running by the time a tool is called (`open_server` handles both).
+
+    ``runner`` enables ``@tool(background=True)`` tools: such a tool runs as a
+    background task - a native MCP task for a client with the tasks extension
+    (see `warpweft.mcp.tasks_extension`), otherwise a *submit* returning a
+    ``task_id`` polled through the shared ``task_status`` / ``task_result`` /
+    ``task_cancel`` tools. A background tool without a ``runner`` is a
+    `FrameworkError` - the advertised behaviour must be real.
+    """
+    bindings = _served_tools(app, options, has_runner=runner is not None)
+    classes = {name: app.registry.get(name) for name in app.registry.names()}
+    binders = dict(options.get("axis_binders") or {})
+    confirm_destructive = options.get("confirm_destructive", False)
+    background = [b for b in bindings.values() if b.meta.background]
     task_tools = _task_tool_descriptors(background) if background else []
 
     async def on_list_tools(ctx: Any, params: Any) -> mt.ListToolsResult:
@@ -531,7 +526,7 @@ def build_server(
 
     async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> CallToolResponse:
         if params.name in _RESERVED_NAMES:
-            return await _handle_task_tool(runner, params)
+            return await _handle_task_tool(runner, bindings, params)
 
         binding = bindings.get(params.name)
         if binding is None:
@@ -566,9 +561,8 @@ def build_server(
                 return error_result(exc)
 
             if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
-                native = supports_native_tasks(ctx)
-                record = await _start_task(app, runner, binding, kwargs, native=native)
-                return create_task_result(record) if native else _submit_result(record)
+                record = await _start_task(app, runner, binding, kwargs)
+                return create_task_result(record) if supports_native_tasks(ctx) else _submit_result(record)
 
             async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
                 # Best-effort: a failed notification must never fail the call.
@@ -590,20 +584,23 @@ def build_server(
 
     # A task handle is a dict (the extension's ``resultType: "task"`` shape),
     # which the SDK serves but its handler signature does not list.
-    server = Server(name, version=version, on_list_tools=on_list_tools, on_call_tool=cast(Any, on_call_tool))
+    server = Server(
+        options.get("name", "warpweft"),
+        version=options.get("version", "0"),
+        on_list_tools=on_list_tools,
+        on_call_tool=cast(Any, on_call_tool),
+    )
     if background and runner is not None:
         install_tasks_extension(server, runner)
     return server
 
 
-async def _start_task(
-    app: App, runner: TaskRunner, binding: ToolBinding, kwargs: dict[str, Any], *, native: bool
-) -> TaskRecord:
+async def _start_task(app: App, runner: TaskRunner, binding: ToolBinding, kwargs: dict[str, Any]) -> TaskRecord:
     """Start a background job; the record is durable before this returns.
 
-    The stored result has the shape its poller expects: for a native task, what
-    the call would have returned inline (``tasks/get`` hands it back as is); for
-    a submit, the ``{"result": ...}`` wrapping that ``task_result`` advertises.
+    The stored result is what the call would have returned inline, whichever
+    surface submitted it: ``tasks/get`` hands it back as is, and ``task_result``
+    adapts it to its own schema on read (`_as_task_result`).
     """
 
     async def job(task_id: str) -> mt.CallToolResult:
@@ -618,7 +615,7 @@ async def _start_task(
                 outcome = await app.container.invoke(binding.component, binding.method, **kwargs)
         except Exception as exc:
             return error_result(exc)
-        return _success_result(binding, outcome) if native else _result(binding, outcome, wrap=True)
+        return _success_result(binding, outcome)
 
     return await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS)
 
@@ -630,7 +627,9 @@ def _submit_result(record: TaskRecord) -> mt.CallToolResult:
     return mt.CallToolResult(content=[text], structured_content=task_id)
 
 
-async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolRequestParams) -> mt.CallToolResult:
+async def _handle_task_tool(
+    runner: TaskRunner | None, bindings: Mapping[str, ToolBinding], params: mt.CallToolRequestParams
+) -> mt.CallToolResult:
     """Serve task_status / task_result / task_cancel against the runner's store."""
     if runner is None:
         unknown = mt.TextContent(type="text", text=f"unknown tool '{params.name}'")
@@ -656,7 +655,7 @@ async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolReques
 
     # _TASK_RESULT: the stored payload is already typed and secret-masked.
     if record.result is not None:
-        return record.result
+        return _as_task_result(bindings.get(record.tool), record.result)
     if record.status in TERMINAL:
         # Terminal but no payload (cancelled, or a job that failed before
         # producing a result): a distinct, non-retryable code - never the
@@ -664,6 +663,19 @@ async def _handle_task_tool(runner: TaskRunner | None, params: mt.CallToolReques
         return _refusal(f"task '{task_id}' ended without a result (status: {record.status})", code=record.status)
     # Still running: the result will appear, so invite the caller to poll again.
     return _refusal(f"task '{task_id}' is not finished yet (status: {record.status})", code="not_ready", retryable=True)
+
+
+def _as_task_result(binding: ToolBinding | None, stored: mt.CallToolResult) -> mt.CallToolResult:
+    """Adapt a stored (inline-shaped) result to ``task_result``'s schema.
+
+    ``task_result`` advertises ``{"result": <op output>}`` for every background
+    op. An op whose inline result is already that wrapper (a non-object return)
+    passes through; an object return gets wrapped. Errors carry no structured
+    content, and a tool this server does not serve is passed through as stored.
+    """
+    if binding is None or stored.structured_content is None or _output_contract(binding)[1]:
+        return stored
+    return stored.model_copy(update={"structured_content": {"result": stored.structured_content}})
 
 
 @contextlib.asynccontextmanager
@@ -678,9 +690,9 @@ async def open_server(
     ``@tool(background=True)`` tools can run; ``False`` serves inline-only
     (such a tool then fails loudly at build).
     """
-    # Pre-flight the tool filters: a bad filter fails here as a plain error,
-    # before the app starts - not wrapped in the task runner's exception group.
-    collect_tools(app, tags=options.get("tags"), include=options.get("include"), exclude=options.get("exclude"))
+    # Validate before starting anything: a bad configuration fails here as a
+    # plain error, not wrapped in the task runner's exception group.
+    _served_tools(app, options, has_runner=background)
     async with app.run(), _optional_runner(background) as runner:
         yield build_server(app, runner=runner, **options)
 

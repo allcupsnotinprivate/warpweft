@@ -238,3 +238,25 @@ def test_serve_without_the_mcp_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(warpweft.mcp, "__getattr__", missing)
     with pytest.raises(SystemExit, match=r"needs the mcp extra"):
         main(["--app", APP, "serve"])
+
+
+def test_serve_rejects_http_flags_on_stdio() -> None:
+    # --port without --transport http would silently start a stdio server.
+    with pytest.raises(SystemExit, match=r"--port, --stateless only apply to --transport http"):
+        main(["--app", APP, "serve", "--port", "9000", "--stateless"])
+
+
+def test_serve_http_fills_unset_flags_with_defaults(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _record_calls(monkeypatch, "http.run_http")
+    code, _, _ = run(capsys, "--app", APP, "serve", "--transport", "http")
+    assert code == 0
+    [call] = calls
+    assert {k: call[k] for k in ("host", "port", "path", "stateless", "json_response")} == {
+        "host": "127.0.0.1",
+        "port": 8000,
+        "path": "/mcp",
+        "stateless": False,
+        "json_response": False,
+    }

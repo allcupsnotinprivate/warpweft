@@ -406,3 +406,85 @@ async def test_mounted_into_a_host_app() -> None:
 async def test_run_http_refuses_trio(anyio_backend: str) -> None:
     with pytest.raises(FrameworkError, match="asyncio"):
         await run_http(echo_app())
+
+
+def app_starting_with(start: Any) -> App:
+    """An app whose one component runs ``start`` when the app starts."""
+
+    class Gated(AComponent[EmptySettings, None, str]):
+        name = "gated"
+
+        async def start(self) -> None:
+            await start()
+
+        @tool
+        @invocable
+        async def ping(self) -> str:
+            return "pong"
+
+    reg = Registry()
+    reg.register(Gated)
+    return App(registry=reg)
+
+
+@pytest.mark.parametrize("anyio_backend", ["asyncio"])  # uvicorn is asyncio-only
+async def test_run_http_reports_a_busy_port(anyio_backend: str) -> None:
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+        with pytest.raises(FrameworkError, match="failed to start"):
+            await run_http(echo_app(), port=port, log_level="critical")
+
+
+@pytest.mark.parametrize("anyio_backend", ["asyncio"])
+async def test_run_http_reports_an_app_that_fails_to_start(anyio_backend: str) -> None:
+    async def fail() -> None:
+        raise RuntimeError("database unreachable")
+
+    with pytest.raises(FrameworkError, match="failed to start"):
+        await run_http(app_starting_with(fail), port=0, log_level="critical")
+
+
+async def test_overlapping_lifespans_are_refused_while_starting() -> None:
+    # The second entry arrives while the first is still starting the app: it
+    # must be refused, not start the app a second time.
+    release = anyio.Event()
+    starting = anyio.Event()
+
+    async def slow_start() -> None:
+        starting.set()
+        await release.wait()
+
+    mcp = asgi_app(app_starting_with(slow_start))
+
+    async def first() -> None:
+        async with mcp.lifespan():
+            pass
+
+    with anyio.fail_after(5):  # a regression would start the app again and block on slow_start
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(first)
+            await starting.wait()
+            try:
+                with pytest.raises(FrameworkError, match="already running"):
+                    async with mcp.lifespan():
+                        pass
+            finally:
+                release.set()
+
+
+async def test_a_websocket_before_the_lifespan_is_closed_not_answered_with_http() -> None:
+    mcp = asgi_app(echo_app())
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {"type": "websocket", "path": "/mcp", "root_path": "", "headers": [], "query_string": b""}
+    await mcp(scope, receive, send)
+    assert [m["type"] for m in sent] == ["websocket.close"]
+    assert sent[0]["code"] == 1013

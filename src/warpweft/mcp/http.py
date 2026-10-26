@@ -31,6 +31,7 @@ from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
+from starlette.websockets import WebSocketClose
 
 from warpweft.core.errors import FrameworkError
 from warpweft.runtime import App
@@ -61,6 +62,10 @@ class MCPHttpApp:
         self._background = background
         self._options = options
         self._http = http
+        #: Claimed synchronously on entering the lifespan, before any await, so
+        #: overlapping entries cannot both pass the one-at-a-time check.
+        self._running = False
+        #: The SDK's app, set only while requests can be served.
         self._inner: Starlette | None = None
         # Starlette implements the ASGI lifespan protocol for the standalone case.
         self._asgi = Starlette(routes=[Mount("", app=self._dispatch)], lifespan=self.lifespan)
@@ -75,26 +80,33 @@ class MCPHttpApp:
 
     @contextlib.asynccontextmanager
     async def _lifespan(self) -> AsyncIterator[None]:
-        if self._inner is not None:
+        if self._running:
             raise FrameworkError("this MCP HTTP app is already running; one instance serves one lifespan at a time")
-        async with open_server(self._app, background=self._background, **self._options) as server:
-            inner = server.streamable_http_app(**self._http)
-            async with inner.router.lifespan_context(inner):
-                self._inner = inner
-                try:
-                    yield
-                finally:
-                    self._inner = None
+        self._running = True
+        try:
+            async with open_server(self._app, background=self._background, **self._options) as server:
+                inner = server.streamable_http_app(**self._http)
+                async with inner.router.lifespan_context(inner):
+                    self._inner = inner
+                    try:
+                        yield
+                    finally:
+                        self._inner = None
+        finally:
+            self._running = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         await self._asgi(scope, receive, send)
 
     async def _dispatch(self, scope: Scope, receive: Receive, send: Send) -> None:
         inner = self._inner
-        if inner is None:
+        if inner is not None:
+            await inner(scope, receive, send)
+        elif scope["type"] == "websocket":
+            # An HTTP response on a websocket scope breaks ASGI; 1013 is "try again later".
+            await WebSocketClose(code=1013)(scope, receive, send)
+        else:
             await PlainTextResponse("MCP server is not running", status_code=503)(scope, receive, send)
-            return
-        await inner(scope, receive, send)
 
 
 def asgi_app(
@@ -169,13 +181,16 @@ async def run_http(
     json_response: bool = False,
     background: bool = True,
     **options: Unpack[ServerOptions],
-) -> None:  # pragma: no cover - binds a real socket until shut down
+) -> None:
     """Serve the app's MCP tools over HTTP with uvicorn until interrupted.
 
     A thin wrapper over `asgi_app` for the common case; for TLS, several
     workers, auth or a different ASGI server, build the app with `asgi_app` and
     serve it yourself. uvicorn runs on asyncio only: under trio, serve
     `asgi_app` with hypercorn instead.
+
+    A server that cannot start - the app fails to start, or the port cannot be
+    bound - raises `FrameworkError` (uvicorn has logged the cause).
     """
     import uvicorn
 
@@ -190,10 +205,12 @@ async def run_http(
         **options,
     )
     server = uvicorn.Server(uvicorn.Config(asgi, host=host, port=port, log_level=log_level, lifespan="on"))
-    await server.serve()
-    if not server.started:
-        # uvicorn logs a startup failure (e.g. the app failed to start) and returns.
-        raise FrameworkError("the MCP HTTP server failed to start; see the log above")
+    try:
+        await server.serve()
+    except SystemExit as exc:
+        # uvicorn logs a startup failure and then calls sys.exit() - not an
+        # exit this library's caller asked for.
+        raise FrameworkError(f"the MCP HTTP server failed to start on {host}:{port}; see the log above") from exc
 
 
 def _require_asyncio() -> None:

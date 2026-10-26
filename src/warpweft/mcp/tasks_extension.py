@@ -36,7 +36,7 @@ import mcp.types as mt
 from mcp_types import INTERNAL_ERROR, INVALID_PARAMS, MISSING_REQUIRED_CLIENT_CAPABILITY
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from .tasks import TaskRecord, TaskRunner
+from .tasks import TERMINAL, TaskRecord, TaskRunner
 
 #: The extension identifier, advertised under ``capabilities.extensions``.
 TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
@@ -119,12 +119,25 @@ def _task_fields(record: TaskRecord) -> dict[str, Any]:
         "status": record.status,
         "createdAt": record.created_at.isoformat(),
         "lastUpdatedAt": record.last_updated_at.isoformat(),
-        "ttlMs": record.ttl_ms,  # required, null meaning unlimited
+        "ttlMs": _ttl_from_creation(record),
         "pollIntervalMs": POLL_INTERVAL_MS,
     }
     if record.status_message is not None:
         fields["statusMessage"] = record.status_message
     return fields
+
+
+def _ttl_from_creation(record: TaskRecord) -> int | None:
+    """The spec's ``ttlMs``: required, counted from creation, ``null`` for unlimited.
+
+    warpweft never expires a running task, so while it runs the honest answer
+    is ``null``. Once settled it is retained ``ttl_ms`` past its final update,
+    which from creation is the run time plus that retention.
+    """
+    if record.ttl_ms is None or record.status not in TERMINAL:
+        return None
+    ran_ms = int((record.last_updated_at - record.created_at).total_seconds() * 1000)
+    return ran_ms + record.ttl_ms
 
 
 def detailed_task(record: TaskRecord) -> dict[str, Any]:

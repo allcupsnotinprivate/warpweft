@@ -265,7 +265,10 @@ that declares it:
   completes - exactly what an inline call would have returned. `tasks/cancel`
   cancels the job.
 
-Native tasks and the `task_*` tools share one runner and store. A tool error
+Native tasks and the `task_*` tools share one runner and store, so a task
+started on either surface can be read on the other, each in its own advertised
+shape. A running task reports `ttlMs: null`, since it never expires; a settled
+one reports its run time plus the retention. A tool error
 completes the task with an `isError` result, as the extension requires;
 `failed` is reserved for a job that crashed without a result. Two optional
 parts of the extension are not implemented: `input_required` tasks (a job never
@@ -285,8 +288,10 @@ async with task_runner(store=my_store) as runner:  # your store survives restart
 
 The names `task_status` / `task_result` / `task_cancel` are reserved; a
 component tool claiming one, or a `background=True` tool served without a
-runner, raises a `FrameworkError` at build time. The default in-memory store
-keeps task state and results for the process lifetime only - a deployment that
+runner, raises a `FrameworkError` at build time. A task never expires while it
+runs, however long it takes; once it settles, its state and result are retained
+for five minutes (`DEFAULT_TTL_MS`). The default in-memory store keeps task
+state and results for the process lifetime only - a deployment that
 must survive a restart supplies its own `TaskStore` (Redis, Postgres, ...).
 The same applies to an HTTP deployment with several workers: each worker has
 its own in-memory store, so a poll can land on a worker that never saw the

@@ -6,15 +6,17 @@ client (the mcp SDK ships none).
 
 from collections.abc import AsyncIterator
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from _support.mcp_tasks import MODERN, CancelTask, TaskFailed, TasksClient, UpdateTask, get_task
+from _support.mcp_tasks import MODERN, CancelTask, DetailedTask, TaskFailed, TasksClient, UpdateTask, get_task
 import anyio
 from mcp import Client
 from mcp.client.extension import ClientExtension
 from mcp.shared.exceptions import MCPError
 import mcp.types as mt
 from mcp_types import INTERNAL_ERROR, INVALID_PARAMS, MISSING_REQUIRED_CLIENT_CAPABILITY
+from pydantic import BaseModel
 import pytest
 
 from warpweft.core.component import AComponent, EmptySettings, invocable
@@ -76,7 +78,7 @@ async def test_background_tool_runs_as_a_native_task() -> None:
     assert result.structured_content == {"result": 42}  # the tool's own result, as if inline
     [handle] = tasks.handles
     assert handle.status == "working"
-    assert handle.ttl_ms is not None
+    assert handle.ttl_ms is None  # a running task never expires
     assert handle.poll_interval_ms is not None
 
 
@@ -212,3 +214,77 @@ def test_a_job_that_crashed_without_a_result_is_failed() -> None:
     assert task["status"] == "failed"
     assert task["error"] == {"code": INTERNAL_ERROR, "message": "store went away"}
     assert task["ttlMs"] is None  # required on the wire, null meaning unlimited
+
+
+def test_a_settled_task_reports_its_ttl_from_creation() -> None:
+    created = datetime.now(UTC)
+    record = TaskRecord(
+        task_id="t",
+        tool="jobs__double",
+        status="completed",
+        created_at=created,
+        last_updated_at=created + timedelta(seconds=10),  # ran for 10 s
+        ttl_ms=1000,
+        result=mt.CallToolResult(content=[]),
+    )
+    assert detailed_task(record)["ttlMs"] == 11_000  # run time + retention
+
+
+# --- one store, two polling surfaces ---------------------------------------------------
+
+
+class Report(BaseModel):
+    month: str
+    total: int
+
+
+def reports_app() -> App:
+    class Reports(AComponent[EmptySettings, None, Report]):
+        name = "reports"
+
+        @tool(background=True)
+        @invocable
+        async def monthly(self, month: str) -> Report:
+            return Report(month=month, total=3)
+
+    reg = Registry()
+    reg.register(Reports)
+    return App(registry=reg)
+
+
+@contextlib.asynccontextmanager
+async def two_clients(app: App) -> AsyncIterator[tuple[Client, TasksClient, Client]]:
+    """A native-tasks client (and its extension) plus a plain client on one server: one runner, one store."""
+    tasks = TasksClient()
+    async with app.run(), task_runner() as runner:
+        server = build_server(app, runner=runner)
+        async with (
+            Client(server, mode=MODERN, extensions=[tasks]) as native,
+            Client(server, mode=MODERN) as plain,
+        ):
+            yield native, tasks, plain
+
+
+async def settled(session: Any, task_id: str) -> DetailedTask:
+    with anyio.fail_after(5):
+        while True:
+            task = await get_task(session, task_id)
+            if task.status != "working":
+                return task
+            await anyio.sleep(0.01)
+
+
+async def test_a_submitted_task_reads_inline_shaped_through_tasks_get() -> None:
+    async with two_clients(reports_app()) as (native, _, plain):
+        submitted = await plain.call_tool("reports__monthly", {"month": "may"})
+        assert submitted.structured_content is not None
+        task = await settled(native.session, submitted.structured_content["task_id"])
+    assert task.result is not None
+    assert task.result["structuredContent"] == {"month": "may", "total": 3}  # the tool's own schema
+
+
+async def test_a_native_task_reads_wrapped_through_task_result() -> None:
+    async with two_clients(reports_app()) as (native, tasks, plain):
+        await native.call_tool("reports__monthly", {"month": "june"})  # resolves once the task completed
+        result = await plain.call_tool("task_result", {"task_id": tasks.handles[0].task_id})
+    assert result.structured_content == {"result": {"month": "june", "total": 3}}  # task_result's own schema

@@ -35,7 +35,8 @@ from pydantic import BaseModel
 
 from warpweft.core.clock import Clock, SystemClock
 
-#: Default retention for a task, in milliseconds, measured from creation.
+#: Default retention for a finished task's state and result, in milliseconds,
+#: measured from when it settled. A running task never expires.
 DEFAULT_TTL_MS = 5 * 60 * 1000
 
 #: A task in a terminal state never changes again.
@@ -44,7 +45,13 @@ TERMINAL: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled"}
 
 @dataclass(frozen=True)
 class TaskRecord:
-    """The durable state of one task. ``result`` is set only once terminal."""
+    """The durable state of one task. ``result`` is set only once terminal.
+
+    ``ttl_ms`` is the retention once the task has settled, counted from its
+    final update (``last_updated_at``); ``None`` keeps it until the store is
+    discarded. A task that is still running never expires, however long it
+    takes - otherwise a slow job would lose its result before producing it.
+    """
 
     task_id: str
     tool: str
@@ -76,7 +83,8 @@ class TaskStore(Protocol):
     warpweft ships `InMemoryTaskStore`; a deployment that must survive a
     process restart supplies its own (Redis, Postgres, ...). All methods are
     async so a backing store can be remote. ``get`` returns ``None`` for an
-    unknown or expired id.
+    unknown or expired id; expiry follows `TaskRecord` (``ttl_ms`` after the
+    task settled, never while it runs).
     """
 
     async def create(self, record: TaskRecord) -> None: ...
@@ -149,10 +157,10 @@ class InMemoryTaskStore:
             )
 
     def _expired(self, record: TaskRecord) -> bool:
-        if record.ttl_ms is None:
+        if record.ttl_ms is None or record.status not in TERMINAL:
             return False
-        age_ms = (self.clock.now() - record.created_at).total_seconds() * 1000
-        return age_ms > record.ttl_ms
+        settled_ms = (self.clock.now() - record.last_updated_at).total_seconds() * 1000
+        return settled_ms > record.ttl_ms
 
 
 #: A background job: given its task id (so it can route progress to the store),
