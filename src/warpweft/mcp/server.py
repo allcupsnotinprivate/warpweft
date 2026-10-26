@@ -12,7 +12,7 @@ telemetry; the result is serialized against the invocable's output schema
 (secrets masked) and returned as both structured and text content.
 """
 
-from collections.abc import AsyncIterator, Callable, Collection, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 import contextlib
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -37,7 +37,7 @@ from .schema import tool_input_schema
 from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRecord, TaskRunner, TaskStatusView, status_view, task_runner
 from .tasks_extension import create_task_result, supports_native_tasks
 from .tasks_extension import install as install_tasks_extension
-from .tool import ToolMeta, is_tool, tool_meta
+from .tool import Icon, ToolMeta, is_tool, tool_meta
 
 #: Derives an axis value (e.g. tenant) from the incoming MCP call - the request
 #: context (``ctx``: session, ``meta``, and ``request`` - the HTTP request on
@@ -65,6 +65,20 @@ class ServerOptions(TypedDict, total=False):
     name: str
     #: Server version reported to clients. Default ``"0"``.
     version: str
+    #: Human-friendly server name for the client's UI (``serverInfo.title``).
+    title: str
+    #: What the server is, in a sentence (``serverInfo.description``).
+    description: str
+    #: Guidance the client hands its model, typically as a system prompt: when
+    #: to use which tool, in what order, what to avoid. Not a place to repeat
+    #: the tool descriptions - the model sees those too.
+    instructions: str
+    #: The server's website (``serverInfo.websiteUrl``).
+    website_url: str
+    #: Icons for the server. On the 2026-07-28 protocol the SDK stamps
+    #: ``serverInfo``, icons included, into every response, so give the server
+    #: ``https:`` URLs and keep ``data:`` URIs for tool icons.
+    icons: Sequence[Icon]
     #: Serve only tools carrying one of these ``@tool`` tags (see `collect_tools`),
     #: so one app can back several servers - e.g. ``{"public"}`` for an assistant.
     tags: Collection[str] | None
@@ -230,6 +244,14 @@ def _annotations(meta: ToolMeta) -> mt.ToolAnnotations | None:
     return mt.ToolAnnotations(**present) if present else None
 
 
+def _mcp_icons(icons: Sequence[Icon]) -> list[mt.Icon] | None:
+    """The SDK's icon list - ``None`` when there are none, so no empty list is advertised."""
+    return [
+        mt.Icon(src=icon.src, mime_type=icon.mime_type, sizes=list(icon.sizes) or None, theme=icon.theme)
+        for icon in icons
+    ] or None
+
+
 def _output_contract(binding: ToolBinding) -> tuple[dict[str, Any], bool]:
     """The advertised output schema, and whether values get result-wrapped.
 
@@ -273,6 +295,7 @@ def _describe_tool(cls: type, binding: ToolBinding, *, native_tasks: bool) -> mt
         input_schema=tool_input_schema(binding.spec.input_model),
         output_schema=output_schema,
         annotations=_annotations(binding.meta),
+        icons=_mcp_icons(binding.meta.icons),
     )
 
 
@@ -587,6 +610,11 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
     server = Server(
         options.get("name", "warpweft"),
         version=options.get("version", "0"),
+        title=options.get("title"),
+        description=options.get("description"),
+        instructions=options.get("instructions"),
+        website_url=options.get("website_url"),
+        icons=_mcp_icons(options.get("icons", ())),
         on_list_tools=on_list_tools,
         on_call_tool=cast(Any, on_call_tool),
     )

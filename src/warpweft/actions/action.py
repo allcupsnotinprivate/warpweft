@@ -22,7 +22,7 @@ actions carry tool metadata whether or not the ``mcp`` extra is installed; the
 optional `warpweft.mcp` layer collects them when a server is built.
 """
 
-from collections.abc import Awaitable, Callable, Collection, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 import inspect
 from typing import Any, ClassVar, TypeVar, cast, get_type_hints
 
@@ -33,7 +33,7 @@ from warpweft.core.component.invocable import InputBinding, invocable, set_input
 from warpweft.core.context import InvocationContext
 from warpweft.core.errors import ConfigurationError
 from warpweft.core.outcome import Outcome
-from warpweft.mcp.tool import tool
+from warpweft.mcp.tool import Icon, tool
 
 TSettings = TypeVar("TSettings", bound=BaseModel)
 TIn = TypeVar("TIn")
@@ -106,6 +106,8 @@ class Action(AComponent[TSettings, TIn, TOut]):
     tool_name: ClassVar[str | None] = None
     #: Human-friendly tool title.
     title: ClassVar[str | None] = None
+    #: Icons clients show next to the tool (`warpweft.mcp.Icon`).
+    icons: ClassVar[Sequence[Icon]] = ()
     #: MCP behaviour hints (left unset unless the action states them).
     read_only: ClassVar[bool | None] = None
     destructive: ClassVar[bool | None] = None
@@ -130,6 +132,7 @@ class Action(AComponent[TSettings, TIn, TOut]):
             tool(
                 name=cls.tool_name,
                 title=cls.title,
+                icons=cls.icons,
                 description=cls.description,
                 read_only=cls.read_only,
                 destructive=cls.destructive,

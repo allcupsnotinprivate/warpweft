@@ -1,6 +1,7 @@
 """The warpweft CLI: app loading, each command, JSON output, error paths."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -260,3 +261,25 @@ def test_serve_http_fills_unset_flags_with_defaults(
         "stateless": False,
         "json_response": False,
     }
+
+
+def test_serve_passes_server_metadata(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    instructions = tmp_path / "instructions.md"
+    instructions.write_text("Look the account up first.\n", encoding="utf-8")
+    calls = _record_calls(monkeypatch, "server.run_stdio")
+    argv = ["serve", "--name", "billing", "--title", "Billing", "--instructions-file", str(instructions)]
+    code, _, _ = run(capsys, "--app", APP, *argv)
+    assert code == 0
+    [call] = calls
+    assert {k: call[k] for k in ("name", "title", "instructions")} == {
+        "name": "billing",
+        "title": "Billing",
+        "instructions": "Look the account up first.\n",
+    }
+
+
+def test_serve_reports_an_unreadable_instructions_file(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match=r"cannot read --instructions-file"):
+        main(["--app", APP, "serve", "--instructions-file", str(tmp_path / "missing.md")])

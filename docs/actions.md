@@ -71,6 +71,7 @@ The metadata comes from class attributes:
 | `description` | tool description (else the `execute` docstring) |
 | `tool_name` | override the derived `<component>__execute` name |
 | `title` | human-friendly title |
+| `icons` | icons clients show next to the tool ([server metadata](mcp.md#server-metadata)) |
 | `read_only`, `destructive`, `idempotent`, `open_world` | MCP behaviour hints |
 | `tags` | labels for [tool filtering](mcp.md#filtering) when a server is built |
 

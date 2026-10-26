@@ -28,7 +28,7 @@ from warpweft.core.component import AComponent, EmptySettings, invocable
 from warpweft.core.composition import Registry
 from warpweft.core.context import report_progress
 from warpweft.core.errors import ConfigurationError, FrameworkError
-from warpweft.mcp import MCPHttpApp, asgi_app, header_binder, run_http, tool
+from warpweft.mcp import Icon, MCPHttpApp, asgi_app, header_binder, run_http, tool
 from warpweft.runtime import App, AxisHandle
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
@@ -139,6 +139,14 @@ async def test_server_options_pass_through() -> None:
     async with serving(asgi_app(echo_app(), include={"echo__say"}, background=False)) as client:
         tools = await client.list_tools()
         assert [t.name for t in tools.tools] == ["echo__say"]
+
+
+async def test_server_metadata_passes_through() -> None:
+    icon = Icon("https://example.com/echo.png")
+    async with serving(asgi_app(echo_app(), title="Echo", instructions="Say things.", icons=[icon])) as client:
+        assert client.instructions == "Say things."
+        assert client.server_info.title == "Echo"
+        assert client.server_info.icons == [mt.Icon(src=icon.src)]
 
 
 async def test_tool_errors_keep_their_guidance() -> None:

@@ -24,6 +24,7 @@ import functools
 import importlib
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any
 
@@ -188,6 +189,7 @@ def _cmd_serve(app: App, args: argparse.Namespace) -> int:
         "exclude": args.exclude,
         "confirm_destructive": args.confirm_destructive,
         "background": not args.no_background,
+        **_identity_options(args),
     }
     if args.transport == "stdio":
         # stdout is the protocol channel: nothing else may be printed to it.
@@ -196,6 +198,17 @@ def _cmd_serve(app: App, args: argparse.Namespace) -> int:
         http = _HTTP_DEFAULTS | {name: getattr(args, name) for name in given}
         anyio.run(functools.partial(_mcp_entry_point("run_http"), app, **http, **options))
     return 0
+
+
+def _identity_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The server-identity options the user set; an unset one keeps the library default."""
+    options: dict[str, Any] = {k: v for k in ("name", "title") if (v := getattr(args, k)) is not None}
+    if args.instructions_file is not None:
+        try:
+            options["instructions"] = Path(args.instructions_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"error: cannot read --instructions-file: {exc}") from exc
+    return options
 
 
 def _mcp_entry_point(name: str) -> Any:
@@ -250,6 +263,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--confirm-destructive", action="store_true", help="Ask the user before running a destructive tool."
     )
     serve.add_argument("--no-background", action="store_true", help="Serve without a background task runner.")
+    serve.add_argument("--name", help="Server name reported to clients. Default: warpweft.")
+    serve.add_argument("--title", help="Human-friendly server name for the client's UI.")
+    serve.add_argument(
+        "--instructions-file", metavar="PATH", help="File with guidance for the model (server instructions)."
+    )
     return parser
 
 
