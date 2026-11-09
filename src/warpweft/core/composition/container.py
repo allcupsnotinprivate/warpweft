@@ -68,6 +68,7 @@ from .introspection import (
 from .registry import Registry
 from .wiring import (
     active_links,
+    deadline_scope,
     degradation_interceptor,
     make_base,
     method_factories,
@@ -186,6 +187,7 @@ class Container:
         self._process_proxies: dict[str, AComponent[Any, Any, Any]] = {}
         self._degraded: set[str] = set()
         self._active_calls = 0
+        self._scoped_start_scopes: set[anyio.CancelScope] = set()
         self._lifecycle_lock = anyio.Lock()
         self._state = _LifecycleState.NEW
 
@@ -271,6 +273,8 @@ class Container:
         async with self._lifecycle_lock:
             if self._state is _LifecycleState.RUNNING:
                 return
+            if self._state is _LifecycleState.DRAINING:
+                raise ConfigurationError("container is draining; finish stop() before restarting")
             self._state = _LifecycleState.STARTING
             self._prepare_run()
             try:
@@ -294,9 +298,13 @@ class Container:
                     await self._cleanup_run()
                 except Exception:
                     # Cleanup must not replace the startup failure callers need
-                    # to diagnose. State is still reset by _cleanup_run's finally.
+                    # to diagnose. Keep the run drainable so stop() can retry it.
                     logger.exception("container startup cleanup failed")
-                finally:
+                    self._state = _LifecycleState.DRAINING
+                except BaseException:
+                    self._state = _LifecycleState.DRAINING
+                    raise
+                else:
                     self._state = _LifecycleState.STOPPED
                 # A task group reports child failures as a (Base)ExceptionGroup;
                 # surface the underlying error so callers see StartupError directly.
@@ -327,19 +335,13 @@ class Container:
         # may still be finishing and own paired decrements in their finally blocks.
 
     async def _cleanup_run(self) -> None:
-        """Stop this run's instances and terminal stores, then drop its state."""
-        try:
-            await self._stop_process_instances()
-        finally:
-            try:
-                for store in self._scoped_stores.values():
-                    await store.close()
-            finally:
-                try:
-                    await self._link_store.close()
-                finally:
-                    self._scoped_stores.clear()
-                    self._clear_transient_state()
+        """Stop and drop this run's state only after every cleanup step succeeds."""
+        await self._stop_process_instances()
+        for store in self._scoped_stores.values():
+            await store.close()
+        await self._link_store.close()
+        self._scoped_stores.clear()
+        self._clear_transient_state()
 
     def _invoker_for(self, name: str) -> Callable[..., Coroutine[Any, Any, Outcome[Any]]]:
         """A bound invoker for one component: ``invoke(method, **kwargs)``.
@@ -376,27 +378,35 @@ class Container:
     async def stop(self) -> None:
         """Drain active calls, then stop everything in reverse dependency order."""
         async with self._lifecycle_lock:
-            if self._state is not _LifecycleState.RUNNING:
+            if self._state not in (_LifecycleState.RUNNING, _LifecycleState.DRAINING):
                 return
             # This transition is synchronous with respect to shutdown: once stop
             # starts, new invoke/get calls are rejected even while old calls drain.
             self._state = _LifecycleState.DRAINING
             logger.info("container stopping")
-            try:
-                with anyio.move_on_after(self._drain_timeout):
-                    while self._active_calls > 0:
-                        await anyio.lowlevel.checkpoint()  # yield so in-flight calls finish
-                await self._cleanup_run()
-            finally:
-                self._state = _LifecycleState.STOPPED
+            with anyio.move_on_after(self._drain_timeout) as drain:
+                while self._active_calls > 0:
+                    await anyio.lowlevel.checkpoint()  # yield so in-flight calls finish
+            if drain.cancelled_caught:
+                # A lazy start holds its store's creation lock. Cancel just those
+                # admitted startups so close() cannot wait until init_timeout.
+                for scope in tuple(self._scoped_start_scopes):
+                    scope.cancel()
+            # On failure or outer cancellation, remain DRAINING with all unfinished
+            # resources retained. A later stop() resumes instead of leaking them.
+            await self._cleanup_run()
+            self._state = _LifecycleState.STOPPED
 
     async def _stop_process_instances(self) -> None:
         for name in self._graph.shutdown_order():
-            instance = self._process.pop(name, None)
+            instance = self._process.get(name)
             if instance is None:
                 continue
             with anyio.move_on_after(self._drain_timeout):
                 await instance.stop()
+            # Publish removal only after stop returns. A failed/cancelled stop
+            # leaves the instance available to the next cleanup attempt.
+            self._process.pop(name, None)
         self._process_chains.clear()
         self._process_proxies.clear()  # drop proxies around the now-stopped instances
 
@@ -424,6 +434,22 @@ class Container:
         if method not in reg.descriptor.invocables:
             raise ConfigurationError(f"component '{component}' has no invocable '{method}'")
 
+        scope_key = (
+            _process_scope_key(component)
+            if reg.descriptor.lifetime is Lifetime.PROCESS
+            else self._axes.resolve(reg.descriptor.scope)
+        )
+        ctx = InvocationContext.begin(
+            operation=f"{component}.{method}",
+            # No ``parent``: invoke takes its id from the explicit arg or the
+            # ambient correlation id, never from a surrounding invocation.
+            correlation_id=correlation_id,
+            clock=self._clock,
+            budget=budget,
+            scope_key=scope_key,
+            arguments=dict(arguments),
+        )
+
         # Admission is synchronous: stop() can observe this call even if lazy
         # scoped construction below suspends before the invocation chain exists.
         self._active_calls += 1
@@ -436,26 +462,25 @@ class Container:
                     raise ComponentUnavailable(f"component '{component}' is degraded")
                 instance = process_instance
                 chain = self._process_chains[(component, method)]
-                scope_key: ScopeKey = _process_scope_key(component)
             else:
                 scoped_store = self._scoped_stores[component]
-                scoped_instance, scope_key = await self._scoped_instance(component, store=scoped_store)
-                instance = scoped_instance
+                created: AComponent[Any, Any, Any] | None = None
+                with anyio.CancelScope() as startup_scope:
+                    self._scoped_start_scopes.add(startup_scope)
+                    try:
+                        async with deadline_scope(ctx):
+                            created, _ = await self._scoped_instance(component, store=scoped_store, scope_key=scope_key)
+                    finally:
+                        self._scoped_start_scopes.discard(startup_scope)
+                if startup_scope.cancel_called:
+                    raise ConfigurationError("container stopped during scoped component startup")
+                instance = cast("AComponent[Any, Any, Any]", created)
+                scoped_instance = instance
                 # Pin before the first post-construction checkpoint: an LRU
                 # eviction must not stop this slice while its call is running.
                 scoped_store.acquire(instance)
                 chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
 
-            ctx = InvocationContext.begin(
-                operation=f"{component}.{method}",
-                # No ``parent``: invoke takes its id from the explicit arg or the
-                # ambient correlation id, never from a surrounding invocation.
-                correlation_id=correlation_id,
-                clock=self._clock,
-                budget=budget,
-                scope_key=scope_key,
-                arguments=dict(arguments),
-            )
             endpoint = instance.endpoint() or default_endpoint(instance.identity.uid, scope_key)
             with use_endpoint(endpoint), use_context(ctx):
                 return await chain(ctx)
@@ -465,10 +490,15 @@ class Container:
                 await scoped_store.release(scoped_instance)
 
     async def _scoped_instance(
-        self, component: str, *, store: InMemoryStateStore | None = None
+        self,
+        component: str,
+        *,
+        store: InMemoryStateStore | None = None,
+        scope_key: ScopeKey | None = None,
     ) -> tuple[AComponent[Any, Any, Any], ScopeKey]:
         reg = self._registrations[component]
-        scope_key = self._axes.resolve(reg.descriptor.scope)
+        if scope_key is None:
+            scope_key = self._axes.resolve(reg.descriptor.scope)
         if store is None:
             store = self._scoped_stores[component]
 

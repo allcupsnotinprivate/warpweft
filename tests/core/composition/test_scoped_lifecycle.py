@@ -162,6 +162,55 @@ async def test_stop_waits_for_slow_scoped_start_and_its_admitted_call(container:
     assert c._active_calls == 0
 
 
+async def test_forced_drain_cancels_a_slow_scoped_start(container: Make) -> None:
+    axes, handles = context_axes("tenant")
+    start_entered = anyio.Event()
+    allow_start = anyio.Event()
+    errors: list[Exception] = []
+
+    class SlowScoped(AComponent[EmptySettings, None, str]):
+        name = "slow-scoped"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+
+        async def start(self) -> None:
+            start_entered.set()
+            await allow_start.wait()
+
+        @invocable
+        async def go(self) -> str:
+            return "unreachable"
+
+    async def call(c: Container) -> None:
+        with handles["tenant"].use("acme"):
+            try:
+                await c.invoke("slow-scoped", "go")
+            except Exception as exc:
+                errors.append(exc)
+
+    async with (
+        container(
+            SlowScoped,
+            config={"slow-scoped": {}},
+            axes=axes,
+            init_timeout=30.0,
+            drain_timeout=0.01,
+        ) as c,
+        anyio.create_task_group() as tg,
+    ):
+        tg.start_soon(call, c)
+        await start_entered.wait()
+        try:
+            with anyio.fail_after(0.2):
+                await c.stop()
+        finally:
+            allow_start.set()  # release the pre-fix implementation after the watchdog fires
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], ConfigurationError)
+    assert c._active_calls == 0
+
+
 async def test_invoke_after_stop_reports_not_started(container: Make) -> None:
     axes, handles = context_axes("tenant")
     recorder = scoped_recorder("rec", events=[], value_of=lambda: handles["tenant"].current())

@@ -120,6 +120,29 @@ async def test_linkless_scoped_budget_is_enforced(use_proxy: bool) -> None:
         await container.stop()
 
 
+async def test_scoped_initialization_consumes_the_overall_budget() -> None:
+    class ScopedSlowStart(AComponent[EmptySettings, None, str]):
+        name = "scoped-slow-start"
+        lifetime = Lifetime.SCOPED
+        scope = ScopeSpec(("tenant",))
+
+        async def start(self) -> None:
+            await anyio.sleep(0.05)
+
+        @invocable
+        async def fetch(self) -> str:
+            return "late"
+
+    axes, handles = context_axes("tenant")
+    container = container_with(ScopedSlowStart, axes=axes, init_timeout=1.0)
+    await container.start()
+    try:
+        with handles["tenant"].use("acme"), anyio.fail_after(0.02), pytest.raises(DeadlineExceeded):
+            await container.invoke("scoped-slow-start", "fetch", budget=0.001)
+    finally:
+        await container.stop()
+
+
 async def test_zero_budget_rejects_linkless_call_before_it_starts() -> None:
     container = container_with(Echo)
     await container.start()

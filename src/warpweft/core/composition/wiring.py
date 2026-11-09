@@ -6,7 +6,8 @@ effective policy restricts which links are allowed, and a link is active only
 when it is implemented and has settings.
 """
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 import inspect
 from typing import Any, cast, get_type_hints
 
@@ -102,6 +103,35 @@ def degradation_interceptor(
     return DegradationInterceptor(cast(DegradationSettings, settings), instance.stub, classifier)
 
 
+@asynccontextmanager
+async def deadline_scope(ctx: InvocationContext) -> AsyncIterator[None]:
+    """Bound one invocation stage by the shared overall deadline.
+
+    The container uses this for lazy scoped initialization as well as the policy
+    chain, so startup consumes the caller's budget instead of preceding it.
+    """
+    if ctx.deadline is None:
+        yield
+        return
+    if ctx.expired():
+        raise DeadlineExceeded(f"deadline exhausted before '{ctx.operation}'")
+
+    remaining = cast("float", ctx.remaining())  # narrowed by the deadline check above
+    with anyio.move_on_after(remaining) as scope:
+        try:
+            yield
+        except Exception as exc:
+            # An inner attempt timeout can win the race with this guard's
+            # cancellation. At the overall expiry it is still the overall
+            # deadline that callers should observe. AnyIO cancellation from
+            # an outer scope is a BaseException and propagates untouched.
+            if scope.cancelled_caught or ctx.expired():
+                raise DeadlineExceeded(f"deadline exhausted during '{ctx.operation}'") from exc
+            raise
+    if scope.cancelled_caught or ctx.expired():
+        raise DeadlineExceeded(f"deadline exhausted after '{ctx.operation}'")
+
+
 def overall_deadline(chain: Next) -> Next:
     """Enforce the invocation deadline around the complete ordered policy chain.
 
@@ -113,25 +143,8 @@ def overall_deadline(chain: Next) -> Next:
     """
 
     async def guarded(ctx: InvocationContext) -> Outcome[Any]:
-        if ctx.deadline is None:
-            return await chain(ctx)
-        if ctx.expired():
-            raise DeadlineExceeded(f"deadline exhausted before '{ctx.operation}'")
-
-        remaining = cast("float", ctx.remaining())  # narrowed by the deadline check above
-        with anyio.move_on_after(remaining) as scope:
-            try:
-                outcome = await chain(ctx)
-            except Exception as exc:
-                # An inner attempt timeout can win the race with this guard's
-                # cancellation. At the overall expiry it is still the overall
-                # deadline that callers should observe. AnyIO cancellation from
-                # an outer scope is a BaseException and propagates untouched.
-                if scope.cancelled_caught or ctx.expired():
-                    raise DeadlineExceeded(f"deadline exhausted during '{ctx.operation}'") from exc
-                raise
-        if scope.cancelled_caught or ctx.expired():
-            raise DeadlineExceeded(f"deadline exhausted after '{ctx.operation}'")
+        async with deadline_scope(ctx):
+            outcome = await chain(ctx)
         return outcome
 
     return guarded

@@ -66,7 +66,12 @@ Validated at build time, before anything starts, with errors naming the pair:
 - `Lifetime.SCOPED` - one instance per axis key (the component's `scope`),
   created lazily on first use and evicted by LRU (calling `stop()`).
 
-`stop()` drains in-flight calls, then stops everything in reverse order.
+`stop()` drains in-flight calls, then stops everything in reverse order. If the
+drain times out during a lazy scoped start, that startup is cancelled so store
+cleanup does not wait for the longer init timeout. If cleanup itself fails or is
+cancelled, the container remains draining and retains unfinished instances:
+retry `stop()` to finish cleanup. Restart is rejected until that succeeds, so a
+new run cannot discard instances that still need stopping.
 
 ## The chain per method
 

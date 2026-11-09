@@ -270,6 +270,92 @@ async def test_chain_construction_failure_cleans_up_and_can_be_retried(
     assert stops == ["stop", "stop"]
 
 
+async def test_stop_failure_keeps_instances_for_retry_and_safe_restart() -> None:
+    stop_calls = 0
+
+    class FlakyStop(AComponent[EmptySettings, None, str]):
+        name = "flaky-stop"
+
+        def __init__(self, settings: EmptySettings) -> None:
+            super().__init__(settings)
+            instances.append(self)
+
+        async def stop(self) -> None:
+            nonlocal stop_calls
+            stop_calls += 1
+            if stop_calls == 1:
+                raise RuntimeError("stop failed")
+
+        @invocable
+        async def go(self) -> str:
+            return "ok"
+
+    instances: list[FlakyStop] = []
+    reg = Registry()
+    reg.register(FlakyStop)
+    container = Container.build(reg, {"flaky-stop": {}})
+    await container.start()
+    first = instances[0]
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        await container.stop()
+    assert not container.started
+    assert container._process["flaky-stop"] is first
+    with pytest.raises(ConfigurationError, match="draining"):
+        await container.start()
+    assert container._process["flaky-stop"] is first
+
+    await container.stop()
+    assert stop_calls == 2
+    assert not container._process
+
+    await container.start()
+    assert instances[-1] is not first
+    assert (await container.invoke("flaky-stop", "go")).value == "ok"
+    await container.stop()
+    assert stop_calls == 3
+
+
+async def test_cancelled_drain_can_be_stopped_again() -> None:
+    release = anyio.Event()
+    stops: list[str] = []
+
+    class CancellableDrain(AComponent[EmptySettings, None, str]):
+        name = "cancellable-drain"
+
+        async def stop(self) -> None:
+            stops.append("stop")
+
+        @invocable
+        async def wait(self) -> str:
+            await release.wait()
+            return "ok"
+
+    reg = Registry()
+    reg.register(CancellableDrain)
+    container = Container.build(reg, {"cancellable-drain": {}})
+    await container.start()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(container.invoke, "cancellable-drain", "wait")
+        while container._active_calls == 0:
+            await anyio.lowlevel.checkpoint()
+
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as stopping:
+                stopping.start_soon(container.stop)
+                await let_tasks_run()
+                scope.cancel()
+
+        assert not container.started
+        assert container._process
+        release.set()
+
+    await container.stop()
+    assert stops == ["stop"]
+    assert not container._process
+
+
 async def test_optional_degradation_does_not_leak_into_a_restart() -> None:
     fail = True
 
