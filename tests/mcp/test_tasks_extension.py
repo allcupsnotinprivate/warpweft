@@ -21,9 +21,9 @@ import pytest
 
 from warpweft.core.component import AComponent, EmptySettings, invocable
 from warpweft.core.composition import Registry
-from warpweft.core.errors import PermanentError
+from warpweft.core.errors import PermanentError, TransientError
 from warpweft.mcp import build_server, task_runner, tool
-from warpweft.mcp.tasks import TaskRecord
+from warpweft.mcp.tasks import TaskRecord, TaskStore
 from warpweft.mcp.tasks_extension import TASKS_EXTENSION, TaskIdParams, UpdateTaskParams, detailed_task
 from warpweft.runtime import App
 
@@ -60,8 +60,10 @@ def jobs_app(gate: anyio.Event | None = None) -> App:
 
 
 @contextlib.asynccontextmanager
-async def connected(app: App, *, extensions: list[ClientExtension], mode: str = MODERN) -> AsyncIterator[Client]:
-    async with app.run(), task_runner() as runner:
+async def connected(
+    app: App, *, extensions: list[ClientExtension], mode: str = MODERN, store: TaskStore | None = None
+) -> AsyncIterator[Client]:
+    async with app.run(), task_runner(store=store) as runner:
         server = build_server(app, runner=runner)
         async with Client(server, mode=mode, extensions=extensions) as client:
             yield client
@@ -173,6 +175,46 @@ async def test_unknown_task_is_invalid_params() -> None:
         with pytest.raises(MCPError) as raised:
             await get_task(client.session, "no-such-task")
     assert raised.value.error.code == INVALID_PARAMS
+
+
+class NativeOutageStore:
+    def __init__(self, *, create: bool = False) -> None:
+        self.fail_create = create
+
+    async def create(self, record: TaskRecord) -> None:
+        if self.fail_create:
+            raise TransientError("store create unavailable")
+
+    async def get(self, task_id: str) -> TaskRecord | None:
+        raise TransientError("store get unavailable")
+
+    async def update(self, task_id: str, **kwargs: Any) -> None:
+        raise AssertionError("not reached")
+
+
+@pytest.mark.parametrize("method", ["get", "update", "cancel"])
+async def test_native_backend_outages_are_deliberate_internal_errors(method: str) -> None:
+    async with connected(jobs_app(), extensions=[TasksClient()], store=NativeOutageStore()) as client:
+        with pytest.raises(MCPError) as raised:
+            if method == "get":
+                await get_task(client.session, "t1")
+            elif method == "update":
+                params = UpdateTaskParams(task_id="t1")
+                await client.session.send_request(UpdateTask(params=params), mt.EmptyResult)
+            else:
+                params = TaskIdParams(task_id="t1")
+                await client.session.send_request(CancelTask(params=params), mt.EmptyResult)
+    assert raised.value.error.code == INTERNAL_ERROR
+    assert raised.value.error.data == {"warpweft.error": "transient", "warpweft.retryable": True}
+    assert "unavailable" in raised.value.error.message
+
+
+async def test_native_submit_backend_outage_is_an_internal_error() -> None:
+    async with connected(jobs_app(), extensions=[TasksClient()], store=NativeOutageStore(create=True)) as client:
+        with pytest.raises(MCPError) as raised:
+            await client.call_tool("jobs__double", {"n": 1})
+    assert raised.value.error.code == INTERNAL_ERROR
+    assert raised.value.error.data == {"warpweft.error": "transient", "warpweft.retryable": True}
 
 
 async def test_tasks_methods_require_the_client_capability() -> None:

@@ -7,8 +7,10 @@ so they work over the stdio handshake with no special transport.
 """
 
 import json
+import logging
 from typing import Any
 
+from _support.task_store_contract import TestInMemoryTaskStore as TestInMemoryTaskStoreContract  # noqa: F401
 import anyio
 import mcp.types as mt
 from mcp_types import TaskStatus
@@ -19,7 +21,7 @@ from warpweft.core.clock import ManualClock
 from warpweft.core.component import AComponent, EmptySettings, invocable
 from warpweft.core.composition import Registry
 from warpweft.core.context import report_progress
-from warpweft.core.errors import FrameworkError, PermanentError
+from warpweft.core.errors import FrameworkError, PermanentError, TransientError
 from warpweft.mcp import build_server, open_server, task_runner, tool
 from warpweft.mcp.tasks import DEFAULT_TTL_MS, InMemoryTaskStore, TaskRecord
 from warpweft.runtime import App
@@ -522,6 +524,116 @@ async def test_unknown_task_is_a_tool_error(connect) -> None:
     assert res.is_error is True
     assert res.meta is not None
     assert res.meta["warpweft.error"] == "unknown_task"
+
+
+# --- store outage containment ------------------------------------------------
+
+
+class UpdateOutageStore:
+    def __init__(self, failures: set[tuple[str, str]]) -> None:
+        self.inner = InMemoryTaskStore(ManualClock())
+        self.failures = failures
+        self.outage = anyio.Event()
+
+    async def create(self, record: TaskRecord) -> None:
+        await self.inner.create(record)
+
+    async def get(self, task_id: str) -> TaskRecord | None:
+        return await self.inner.get(task_id)
+
+    async def update(self, task_id: str, *, status: TaskStatus, **kwargs: Any) -> None:
+        if (task_id, status) in self.failures:
+            self.outage.set()
+            raise TransientError(f"{status} persistence unavailable")
+        await self.inner.update(task_id, status=status, **kwargs)
+
+
+async def test_terminal_store_outage_is_not_misclassified_as_a_job_failure(caplog: pytest.LogCaptureFixture) -> None:
+    store = UpdateOutageStore({("task-1", "completed")})
+    ids = iter(["task-1", "task-2"])
+    caplog.set_level(logging.ERROR, logger="warpweft.mcp.tasks")
+    async with task_runner(store=store, clock=store.inner.clock, id_factory=lambda: next(ids)) as runner:
+        first = await runner.start("demo", const_job(ok("first")), ttl_ms=None)
+        second = await runner.start("demo", const_job(ok("second")), ttl_ms=None)
+        done = await poll_store(store.inner, second.task_id, "completed")
+        assert done.result == ok("second")
+        with anyio.fail_after(2):
+            await store.outage.wait()
+        assert runner._scopes == {}
+        persisted = await store.get(first.task_id)
+    assert persisted is not None
+    assert persisted.status == "working"  # no false fallback to failed
+    assert "completed" in caplog.text
+    assert "persistence unavailable" in caplog.text
+
+
+async def test_fallback_store_outage_is_contained_and_logged(caplog: pytest.LogCaptureFixture) -> None:
+    store = UpdateOutageStore({("task-1", "failed")})
+    ids = iter(["task-1", "task-2"])
+    caplog.set_level(logging.ERROR, logger="warpweft.mcp.tasks")
+
+    async def broken(task_id: str) -> mt.CallToolResult:
+        raise RuntimeError("job broke")
+
+    async with task_runner(store=store, clock=store.inner.clock, id_factory=lambda: next(ids)) as runner:
+        first = await runner.start("demo", broken, ttl_ms=None)
+        second = await runner.start("demo", const_job(ok()), ttl_ms=None)
+        await poll_store(store.inner, second.task_id, "completed")
+        with anyio.fail_after(2):
+            await store.outage.wait()
+        assert runner._scopes == {}
+        persisted = await store.get(first.task_id)
+    assert persisted is not None
+    assert persisted.status == "working"
+    assert "failed" in caplog.text
+    assert "persistence unavailable" in caplog.text
+
+
+class SubmitOutageStore:
+    def __init__(self) -> None:
+        self.fail_get = False
+
+    async def create(self, record: TaskRecord) -> None:
+        raise TransientError("create unavailable")
+
+    async def get(self, task_id: str) -> TaskRecord | None:
+        raise TransientError("get unavailable")
+
+    async def update(self, task_id: str, **kwargs: Any) -> None:
+        raise AssertionError("no job may reach update")
+
+
+async def test_plain_submit_create_outage_is_an_error_result_without_spawning(connect) -> None:
+    ran = False
+
+    class Never(AComponent[EmptySettings, None, str]):
+        name = "never"
+
+        @tool(background=True)
+        @invocable
+        async def run(self) -> str:
+            nonlocal ran
+            ran = True
+            return "bad"
+
+    reg = Registry()
+    reg.register(Never)
+    store = SubmitOutageStore()
+    async with task_runner(store=store) as runner, connect(App(registry=reg), runner=runner) as client:
+        response = await client.call_tool("never__run", {})
+        assert runner._scopes == {}
+    assert response.is_error is True
+    assert response.meta == {"warpweft.error": "transient", "warpweft.retryable": True}
+    assert ran is False
+
+
+@pytest.mark.parametrize("operation", ["task_status", "task_result", "task_cancel"])
+async def test_plain_poll_and_cancel_store_outages_use_error_taxonomy(connect, operation: str) -> None:
+    store = SubmitOutageStore()
+    async with task_runner(store=store) as runner, connect(app_with(Quick), runner=runner) as client:
+        response = await client.call_tool(operation, {"task_id": "t1"})
+    assert response.is_error is True
+    assert response.meta == {"warpweft.error": "transient", "warpweft.retryable": True}
 
 
 # --- wire: build-time guards -------------------------------------------------

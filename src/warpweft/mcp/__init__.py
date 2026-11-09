@@ -14,14 +14,24 @@ from .tool import Icon, ToolMeta, is_tool, tool
 if TYPE_CHECKING:
     from .http import MCPHttpApp, asgi_app, header_binder, run_http
     from .server import AxisBinder, ServerOptions, ToolBinding, build_server, collect_tools, open_server, run_stdio
-    from .tasks import InMemoryTaskStore, TaskRecord, TaskRunner, TaskStore, task_runner
+    from .tasks import (
+        InMemoryTaskStore,
+        InvalidTaskTransitionError,
+        TaskAlreadyExistsError,
+        TaskRecord,
+        TaskRunner,
+        TaskStore,
+        task_runner,
+    )
 
 __all__ = [
     "AxisBinder",
     "Icon",
     "InMemoryTaskStore",
+    "InvalidTaskTransitionError",
     "MCPHttpApp",
     "ServerOptions",
+    "TaskAlreadyExistsError",
     "TaskRecord",
     "TaskRunner",
     "TaskStore",
@@ -46,7 +56,17 @@ _LAZY_SERVER = frozenset(
 #: Names served lazily from ``.http`` (which imports the mcp SDK and starlette).
 _LAZY_HTTP = frozenset({"MCPHttpApp", "asgi_app", "header_binder", "run_http"})
 #: Names served lazily from ``.tasks`` (which imports the mcp SDK).
-_LAZY_TASKS = frozenset({"InMemoryTaskStore", "TaskRecord", "TaskRunner", "TaskStore", "task_runner"})
+_LAZY_TASKS = frozenset(
+    {
+        "InMemoryTaskStore",
+        "InvalidTaskTransitionError",
+        "TaskAlreadyExistsError",
+        "TaskRecord",
+        "TaskRunner",
+        "TaskStore",
+        "task_runner",
+    }
+)
 
 
 def __getattr__(name: str) -> Any:

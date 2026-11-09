@@ -36,6 +36,7 @@ import mcp.types as mt
 from mcp_types import INTERNAL_ERROR, INVALID_PARAMS, MISSING_REQUIRED_CLIENT_CAPABILITY
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
+from .errors import error_metadata
 from .tasks import TERMINAL, TaskRecord, TaskRunner
 
 #: The extension identifier, advertised under ``capabilities.extensions``.
@@ -76,6 +77,15 @@ def create_task_result(record: TaskRecord) -> dict[str, Any]:
     return {"resultType": "task", **_task_fields(record)}
 
 
+def task_backend_error(exc: Exception, operation: str) -> MCPError:
+    """Translate a store failure into a deliberate protocol-level error."""
+    return MCPError(
+        code=INTERNAL_ERROR,
+        message=f"Task store {operation} failed: {exc}",
+        data=error_metadata(exc),
+    )
+
+
 def install(server: Server[Any], runner: TaskRunner) -> None:
     """Advertise the extension on ``server`` and serve its methods from ``runner``."""
 
@@ -107,7 +117,10 @@ async def _record(ctx: Any, runner: TaskRunner, task_id: str) -> TaskRecord:
             message="Missing required client capability",
             data={"requiredCapabilities": {"extensions": {TASKS_EXTENSION: {}}}},
         )
-    record = await runner.store.get(task_id)
+    try:
+        record = await runner.store.get(task_id)
+    except Exception as exc:
+        raise task_backend_error(exc, "get") from exc
     if record is None:
         raise MCPError(code=INVALID_PARAMS, message=f"Failed to retrieve task: task '{task_id}' not found")
     return record

@@ -35,7 +35,7 @@ from warpweft.runtime import App, AxisHandle
 from .errors import error_result
 from .schema import tool_input_schema
 from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRecord, TaskRunner, TaskStatusView, status_view, task_runner
-from .tasks_extension import create_task_result, supports_native_tasks
+from .tasks_extension import create_task_result, supports_native_tasks, task_backend_error
 from .tasks_extension import install as install_tasks_extension
 from .tool import Icon, ToolMeta, is_tool, tool_meta
 
@@ -595,8 +595,14 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
                 return error_result(exc)
 
             if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
-                record = await _start_task(app, runner, binding, kwargs)
-                return create_task_result(record) if supports_native_tasks(ctx) else _submit_result(record)
+                native = supports_native_tasks(ctx)
+                try:
+                    record = await _start_task(app, runner, binding, kwargs)
+                except Exception as exc:
+                    if native:
+                        raise task_backend_error(exc, "create") from exc
+                    return error_result(exc)
+                return create_task_result(record) if native else _submit_result(record)
 
             async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
                 # Best-effort: a failed notification must never fail the call.
@@ -678,7 +684,10 @@ async def _handle_task_tool(
     if not isinstance(task_id, str) or not task_id:
         return _refusal("task_id is required", code="invalid_arguments")
 
-    record = await runner.store.get(task_id)
+    try:
+        record = await runner.store.get(task_id)
+    except Exception as exc:
+        return error_result(exc)
     if record is None:
         return _refusal(f"unknown task '{task_id}'", code="unknown_task")
 
@@ -689,7 +698,10 @@ async def _handle_task_tool(
         await runner.cancel(task_id)
         # Report the state as it stands; the job settles to ``cancelled``
         # asynchronously as its scope unwinds.
-        fresh = await runner.store.get(task_id)
+        try:
+            fresh = await runner.store.get(task_id)
+        except Exception as exc:
+            return error_result(exc)
         return _status_result(status_view(fresh or record))
 
     # _TASK_RESULT: the stored payload is already typed and secret-masked.

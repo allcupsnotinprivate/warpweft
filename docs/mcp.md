@@ -333,6 +333,19 @@ async with task_runner(store=my_store) as runner:  # your store survives restart
     ...
 ```
 
+A custom `TaskStore` must apply `create` and `update` atomically. Creating a
+live duplicate raises `TaskAlreadyExistsError` and leaves the original record
+untouched; an expired id may be reused. Updates allow progress while `working`
+and `working` to `completed`, `failed`, or `cancelled`. Unknown and expired ids
+are no-ops, terminal records are immutable, and the first linearized terminal
+write wins. Unsupported nonterminal transitions raise
+`InvalidTaskTransitionError`. Ignored writes must preserve the original record
+and settlement timestamp so they cannot extend its TTL. Both errors are
+exported from `warpweft.mcp`. A custom store should raise
+`warpweft.core.errors.TransientError` for a retryable backend outage: plain
+task tools use the standard retryable error metadata, while native task methods
+return a deliberate MCP `INTERNAL_ERROR` with the same classification.
+
 The names `task_status` / `task_result` / `task_cancel` are reserved; a
 component tool claiming one, or a `background=True` tool served without a
 runner, raises a `FrameworkError` at build time. A task never expires while it

@@ -48,13 +48,20 @@ def _classify(exc: BaseException) -> tuple[str, bool, str]:
     return "error", False, ""
 
 
-def error_result(exc: BaseException) -> mt.CallToolResult:
-    """Map an exception to a tool error result with retry guidance in meta."""
-    code, retryable, hint = _classify(exc)
+def error_metadata(exc: BaseException) -> dict[str, Any]:
+    """Classify ``exc`` into the metadata shared by tool and protocol errors."""
+    code, retryable, _ = _classify(exc)
     meta: dict[str, Any] = {"warpweft.error": code, "warpweft.retryable": retryable}
     if isinstance(exc, CircuitOpen) and exc.retry_after is not None:
         meta["warpweft.retry_after_s"] = round(exc.retry_after, 3)
     if isinstance(exc, RetryExhausted):
         meta["warpweft.attempts"] = exc.attempts
+    return meta
+
+
+def error_result(exc: BaseException) -> mt.CallToolResult:
+    """Map an exception to a tool error result with retry guidance in meta."""
+    code, _, hint = _classify(exc)
+    meta = error_metadata(exc)
     text = f"{exc}\n{hint}" if hint else str(exc)
     return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)], is_error=True, meta=meta)
