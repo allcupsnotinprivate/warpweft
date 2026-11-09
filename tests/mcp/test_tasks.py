@@ -69,6 +69,35 @@ async def test_create_and_get_roundtrip() -> None:
     assert await store.get("t1") == rec
 
 
+def test_task_scope_is_frozen_serializable_and_canonical() -> None:
+    from dataclasses import FrozenInstanceError, asdict
+
+    from warpweft.mcp import TaskScope
+
+    scope = TaskScope("tenant-jobs", (("tenant", "acme"), ("region", "eu")))
+    assert scope.axes == (("region", "eu"), ("tenant", "acme"))
+    assert asdict(scope) == {
+        "namespace": "tenant-jobs",
+        "axes": (("region", "eu"), ("tenant", "acme")),
+    }
+    with pytest.raises(FrozenInstanceError):
+        scope.namespace = "other"  # type: ignore[misc]
+
+
+def test_existing_task_record_construction_remains_valid_and_legacy() -> None:
+    assert record(ManualClock()).scope is None
+
+
+async def test_runner_default_scope_is_local_and_updates_preserve_it() -> None:
+    async with task_runner(clock=ManualClock()) as runner:
+        rec = await runner.start("demo", const_job(ok()), ttl_ms=None)
+        assert rec.scope is not None
+        assert rec.scope.namespace == "local"
+        assert rec.scope.axes == ()
+        done = await poll_store(runner.store, rec.task_id, "completed")  # type: ignore[arg-type]
+        assert done.scope == rec.scope
+
+
 async def test_get_unknown_is_none() -> None:
     assert await InMemoryTaskStore(ManualClock()).get("missing") is None
 

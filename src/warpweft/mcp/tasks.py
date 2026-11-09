@@ -34,6 +34,7 @@ import mcp.types as mt
 from mcp_types import TaskStatus
 from pydantic import BaseModel
 
+from warpweft.core.axes import ScopeKey
 from warpweft.core.clock import Clock, SystemClock
 from warpweft.core.errors import PermanentError
 
@@ -65,6 +66,20 @@ class InvalidTaskTransitionError(PermanentError):
         self.requested = requested
 
 
+@dataclass(frozen=True, slots=True)
+class TaskScope:
+    """The owner of a task: a server namespace plus canonical axis values."""
+
+    namespace: str
+    axes: ScopeKey = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "axes", tuple(sorted(self.axes)))
+
+
+_LOCAL_SCOPE = TaskScope("local")
+
+
 @dataclass(frozen=True)
 class TaskRecord:
     """The durable state of one task. ``result`` is set only once terminal.
@@ -84,6 +99,9 @@ class TaskRecord:
     status_message: str | None = None
     #: The final ``tools/call`` payload, retained for ``task_result``.
     result: mt.CallToolResult | None = None
+    #: Exact owner required by every server-side read/update/cancel. ``None``
+    #: denotes a legacy record, which is deliberately not a wildcard.
+    scope: TaskScope | None = None
 
 
 class TaskStatusView(BaseModel):
@@ -114,7 +132,8 @@ class TaskStore(Protocol):
     working-to-terminal transitions only. Unknown/expired ids and every update
     to a terminal record are no-ops; other transitions raise
     `InvalidTaskTransitionError`. The first linearized terminal write wins, and
-    ignored writes must not change the record, its timestamp, or its TTL.
+    ignored writes must not change the record, its timestamp, or its TTL. Every
+    update preserves ``record.scope``.
     A retryable backend outage should be raised as ``TransientError`` so both
     MCP surfaces can give the caller accurate retry guidance.
     """
@@ -246,14 +265,22 @@ class TaskRunner:
     def store(self) -> TaskStore:
         return self._store
 
-    async def start(self, tool: str, job: TaskJob, *, ttl_ms: int | None) -> TaskRecord:
+    async def start(
+        self,
+        tool: str,
+        job: TaskJob,
+        *,
+        ttl_ms: int | None,
+        scope: TaskScope | None = None,
+    ) -> TaskRecord:
         """Mint an id, durably create the task, then spawn it.
 
         The record is persisted before we return so a poll that races the
         spawn always finds the task. The cancel scope is registered *here*,
         synchronously before ``start_soon``, so a ``cancel`` that arrives before
         the background job has actually started running is still honoured (there
-        is no window where the scope is missing).
+        is no window where the scope is missing). ``scope`` defaults to the
+        single-owner local scope; servers normally pass their request-derived scope.
         """
         now = self._clock.now()
         record = TaskRecord(
@@ -263,11 +290,12 @@ class TaskRunner:
             created_at=now,
             last_updated_at=now,
             ttl_ms=ttl_ms,
+            scope=scope or _LOCAL_SCOPE,
         )
         await self._store.create(record)
-        scope = anyio.CancelScope()
-        self._scopes[record.task_id] = scope
-        self._tg.start_soon(self._run, record.task_id, job, scope)
+        cancel_scope = anyio.CancelScope()
+        self._scopes[record.task_id] = cancel_scope
+        self._tg.start_soon(self._run, record.task_id, job, cancel_scope)
         return record
 
     async def cancel(self, task_id: str) -> None:

@@ -28,7 +28,7 @@ responses - and ``notifications/tasks`` push updates; clients poll.
 Spec: https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks
 """
 
-from typing import Any
+from typing import Any, Protocol
 
 from mcp.server.lowlevel.server import Server
 from mcp.shared.exceptions import MCPError
@@ -36,8 +36,10 @@ import mcp.types as mt
 from mcp_types import INTERNAL_ERROR, INVALID_PARAMS, MISSING_REQUIRED_CLIENT_CAPABILITY
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
+from warpweft.core.errors import ConfigurationError
+
 from .errors import error_metadata
-from .tasks import TERMINAL, TaskRecord, TaskRunner
+from .tasks import TERMINAL, TaskRecord, TaskRunner, TaskScope
 
 #: The extension identifier, advertised under ``capabilities.extensions``.
 TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
@@ -58,6 +60,10 @@ class UpdateTaskParams(TaskIdParams):
     """Params of ``tasks/update``: answers to a task's ``inputRequests``."""
 
     input_responses: dict[str, Any] | None = None
+
+
+class TaskScopeProvider(Protocol):
+    def scope(self, ctx: Any, params: mt.CallToolRequestParams) -> TaskScope: ...
 
 
 def supports_native_tasks(ctx: Any) -> bool:
@@ -86,20 +92,20 @@ def task_backend_error(exc: Exception, operation: str) -> MCPError:
     )
 
 
-def install(server: Server[Any], runner: TaskRunner) -> None:
+def install(server: Server[Any], runner: TaskRunner, *, scope_provider: TaskScopeProvider) -> None:
     """Advertise the extension on ``server`` and serve its methods from ``runner``."""
 
     async def get_task(ctx: Any, params: TaskIdParams) -> dict[str, Any]:
-        return detailed_task(await _record(ctx, runner, params.task_id))
+        return detailed_task(await _record(ctx, runner, params.task_id, "tasks/get", params, scope_provider))
 
     async def update_task(ctx: Any, params: UpdateTaskParams) -> dict[str, Any]:
         # A warpweft task never enters input_required, so every response is for
         # an unknown key - which the spec says to ignore.
-        await _record(ctx, runner, params.task_id)
+        await _record(ctx, runner, params.task_id, "tasks/update", params, scope_provider)
         return {}
 
     async def cancel_task(ctx: Any, params: TaskIdParams) -> dict[str, Any]:
-        await _record(ctx, runner, params.task_id)
+        await _record(ctx, runner, params.task_id, "tasks/cancel", params, scope_provider)
         await runner.cancel(params.task_id)  # cooperative; settles to cancelled as the job unwinds
         return {}
 
@@ -109,21 +115,42 @@ def install(server: Server[Any], runner: TaskRunner) -> None:
     server.add_request_handler("tasks/cancel", TaskIdParams, cancel_task)
 
 
-async def _record(ctx: Any, runner: TaskRunner, task_id: str) -> TaskRecord:
-    """Load a task for a ``tasks/*`` request, or raise the spec's protocol error."""
+async def _record(
+    ctx: Any,
+    runner: TaskRunner,
+    task_id: str,
+    method: str,
+    params: TaskIdParams,
+    scope_provider: TaskScopeProvider,
+) -> TaskRecord:
+    """Load an owned task for a ``tasks/*`` request, or raise its protocol error."""
     if not supports_native_tasks(ctx):
         raise MCPError(
             code=MISSING_REQUIRED_CLIENT_CAPABILITY,
             message="Missing required client capability",
             data={"requiredCapabilities": {"extensions": {TASKS_EXTENSION: {}}}},
         )
+    synthetic = mt.CallToolRequestParams(
+        name=method,
+        arguments=params.model_dump(mode="python", by_alias=False, exclude_none=True),
+    )
+    try:
+        scope = scope_provider.scope(ctx, synthetic)
+    except ConfigurationError as exc:
+        raise _unknown_task(task_id) from exc
+    except Exception as exc:
+        raise task_backend_error(exc, "authorize") from exc
     try:
         record = await runner.store.get(task_id)
     except Exception as exc:
         raise task_backend_error(exc, "get") from exc
-    if record is None:
-        raise MCPError(code=INVALID_PARAMS, message=f"Failed to retrieve task: task '{task_id}' not found")
+    if record is None or record.scope != scope:
+        raise _unknown_task(task_id)
     return record
+
+
+def _unknown_task(task_id: str) -> MCPError:
+    return MCPError(code=INVALID_PARAMS, message=f"Failed to retrieve task: task '{task_id}' not found")
 
 
 def _task_fields(record: TaskRecord) -> dict[str, Any]:

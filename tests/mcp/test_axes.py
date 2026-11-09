@@ -19,7 +19,7 @@ from warpweft.runtime import App, AxisHandle
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
-def _tenant_app(*, background: bool = False) -> tuple[App, AxisHandle]:
+def _tenant_app(*, background: bool = False, required: bool = False) -> tuple[App, AxisHandle]:
     """An app whose one tool returns the current ``tenant`` axis value."""
     holder: dict[str, AxisHandle] = {}
 
@@ -34,7 +34,7 @@ def _tenant_app(*, background: bool = False) -> tuple[App, AxisHandle]:
     reg = Registry()
     reg.register(Svc)
     app = App(registry=reg)
-    holder["handle"] = app.axis("tenant", default="unset")
+    holder["handle"] = app.axis("tenant") if required else app.axis("tenant", default="unset")
     return app, holder["handle"]
 
 
@@ -116,6 +116,18 @@ async def test_background_job_inherits_the_bound_axis(connect) -> None:
     assert result.structured_content == {"result": "acme"}
 
 
+async def test_background_submit_without_required_axis_fails_closed(connect) -> None:
+    app, tenant = _tenant_app(background=True, required=True)
+    async with (
+        task_runner() as runner,
+        connect(app, runner=runner, axis_binders={tenant: lambda ctx, params: None}) as client,
+    ):
+        response = await client.call_tool("svc__whoami", {})
+        assert response.is_error is True
+        assert response.meta == {"warpweft.error": "permanent", "warpweft.retryable": False}
+        assert runner._scopes == {}
+
+
 def _multi_axis_app() -> tuple[App, dict[str, AxisHandle]]:
     """An app whose tool reports both the ``tenant`` and ``region`` axis values."""
     holder: dict[str, AxisHandle] = {}
@@ -153,19 +165,20 @@ async def test_concurrent_background_jobs_keep_submit_time_tenants(connect) -> N
     app, tenant = _tenant_app(background=True)
     binders = {tenant: lambda ctx, params: (params.arguments or {}).get("as_tenant")}
 
-    async def wait_result(client: Any, task_id: str) -> Any:
+    async def wait_result(client: Any, task_id: str, tenant: str) -> Any:
         with anyio.fail_after(2):
             while True:
-                status = await client.call_tool("task_status", {"task_id": task_id})
+                args = {"task_id": task_id, "as_tenant": tenant}
+                status = await client.call_tool("task_status", args)
                 if status.structured_content and status.structured_content["status"] == "completed":
-                    return await client.call_tool("task_result", {"task_id": task_id})
+                    return await client.call_tool("task_result", args)
                 await anyio.sleep(0.01)
 
     async with task_runner() as runner, connect(app, runner=runner, axis_binders=binders) as client:
         acme = (await client.call_tool("svc__whoami", {"as_tenant": "acme"})).structured_content["task_id"]
         globex = (await client.call_tool("svc__whoami", {"as_tenant": "globex"})).structured_content["task_id"]
-        acme_result = await wait_result(client, acme)
-        globex_result = await wait_result(client, globex)
+        acme_result = await wait_result(client, acme, "acme")
+        globex_result = await wait_result(client, globex, "globex")
 
     assert acme_result.structured_content == {"result": "acme"}
     assert globex_result.structured_content == {"result": "globex"}

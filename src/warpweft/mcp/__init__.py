@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         TaskAlreadyExistsError,
         TaskRecord,
         TaskRunner,
+        TaskScope,
         TaskStore,
         task_runner,
     )
@@ -34,6 +35,7 @@ __all__ = [
     "TaskAlreadyExistsError",
     "TaskRecord",
     "TaskRunner",
+    "TaskScope",
     "TaskStore",
     "ToolBinding",
     "ToolMeta",
@@ -63,6 +65,7 @@ _LAZY_TASKS = frozenset(
         "TaskAlreadyExistsError",
         "TaskRecord",
         "TaskRunner",
+        "TaskScope",
         "TaskStore",
         "task_runner",
     }

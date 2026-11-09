@@ -35,9 +35,10 @@ def test_testing_module_reexports_core_testing() -> None:
 
 
 def test_mcp_is_reachable_with_the_extra() -> None:
-    from warpweft.mcp import InvalidTaskTransitionError, TaskAlreadyExistsError, build_server, tool
+    from warpweft.mcp import InvalidTaskTransitionError, TaskAlreadyExistsError, TaskScope, build_server, tool
 
     assert build_server is not None
     assert tool is not None
     assert TaskAlreadyExistsError is not None
     assert InvalidTaskTransitionError is not None
+    assert TaskScope is not None

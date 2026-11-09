@@ -340,7 +340,8 @@ and `working` to `completed`, `failed`, or `cancelled`. Unknown and expired ids
 are no-ops, terminal records are immutable, and the first linearized terminal
 write wins. Unsupported nonterminal transitions raise
 `InvalidTaskTransitionError`. Ignored writes must preserve the original record
-and settlement timestamp so they cannot extend its TTL. Both errors are
+and settlement timestamp so they cannot extend its TTL. Updates must also
+preserve the record's ownership `scope`. Both errors are
 exported from `warpweft.mcp`. A custom store should raise
 `warpweft.core.errors.TransientError` for a retryable backend outage: plain
 task tools use the standard retryable error metadata, while native task methods
@@ -356,6 +357,43 @@ must survive a restart supplies its own `TaskStore` (Redis, Postgres, ...).
 The same applies to an HTTP deployment with several workers: each worker has
 its own in-memory store, so a poll can land on a worker that never saw the
 task. Run one worker, or supply a shared store.
+
+### Task ownership
+
+Every task has an immutable, serializable `TaskScope`: a server `namespace`
+plus the canonical, sorted axis values captured at submit. Plain
+`task_status` / `task_result` / `task_cancel` and native
+`tasks/get` / `tasks/update` / `tasks/cancel` all require exact namespace and
+axes equality. A mismatch is indistinguishable from an unknown id
+(`unknown_task` on the plain tools, `INVALID_PARAMS` natively), never a
+separate forbidden response, and a denied operation has no side effects. The
+same owner can freely read a task through either surface.
+
+A built server generates a random namespace by default, so two applications
+sharing one store cannot read each other's tasks even when their axes match.
+Workers sharing a store must instead configure the same stable namespace:
+
+```python
+server = build_server(app, runner=runner, task_namespace="billing")
+```
+
+With no `axis_binders`, the axis tuple is empty and the namespace is the sole
+owner, which is the normal single-owner stdio setup. Otherwise the server runs
+the binders on submit and on every subsequent plain or native task operation,
+and snapshots each `AxisHandle.current()` value, including its default. A
+missing required axis fails closed. Header- and token-derived binders work on
+both surfaces. An argument-derived binder must receive its argument on plain
+`task_*` polling calls as well as submit; native task methods do not carry the
+original tool arguments, so a required value available only there cannot be
+resolved and native access fails closed. Use a header/auth binder or an axis
+default when native access is required.
+
+`TaskScope` is exported from `warpweft.mcp`; `TaskRecord.scope` is a trailing,
+defaulted field, so existing record construction remains valid. Custom stores
+must persist it and preserve it through updates. Legacy records whose scope is
+`None` are not wildcard-readable: they are inaccessible through the server.
+Drain such tasks before upgrading, or deliberately backfill the exact intended
+scope in a custom-store migration.
 
 ## Per-request axes (tenancy)
 

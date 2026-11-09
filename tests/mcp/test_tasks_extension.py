@@ -295,11 +295,11 @@ def reports_app() -> App:
 
 
 @contextlib.asynccontextmanager
-async def two_clients(app: App) -> AsyncIterator[tuple[Client, TasksClient, Client]]:
+async def two_clients(app: App, **server_options: Any) -> AsyncIterator[tuple[Client, TasksClient, Client]]:
     """A native-tasks client (and its extension) plus a plain client on one server: one runner, one store."""
     tasks = TasksClient()
     async with app.run(), task_runner() as runner:
-        server = build_server(app, runner=runner)
+        server = build_server(app, runner=runner, **server_options)
         async with (
             Client(server, mode=MODERN, extensions=[tasks]) as native,
             Client(server, mode=MODERN) as plain,
@@ -330,3 +330,70 @@ async def test_a_native_task_reads_wrapped_through_task_result() -> None:
         await native.call_tool("reports__monthly", {"month": "june"})  # resolves once the task completed
         result = await plain.call_tool("task_result", {"task_id": tasks.handles[0].task_id})
     assert result.structured_content == {"result": {"month": "june", "total": 3}}  # task_result's own schema
+
+
+@pytest.mark.parametrize(
+    ("first_namespace", "second_namespace", "allowed"),
+    [("a", "b", False), ("shared", "shared", True), (None, None, False)],
+)
+async def test_namespace_is_part_of_ownership_even_with_identical_axes(
+    first_namespace: str | None, second_namespace: str | None, allowed: bool
+) -> None:
+    app = reports_app()
+    tenant = app.axis("tenant")
+    binders = {tenant: lambda ctx, params: "acme"}
+    first_options = {} if first_namespace is None else {"task_namespace": first_namespace}
+    second_options = {} if second_namespace is None else {"task_namespace": second_namespace}
+    async with app.run(), task_runner() as runner:
+        first = build_server(app, runner=runner, axis_binders=binders, **first_options)
+        second = build_server(app, runner=runner, axis_binders=binders, **second_options)
+        async with Client(first, mode=MODERN) as owner, Client(second, mode=MODERN) as other:
+            submitted = await owner.call_tool("reports__monthly", {"month": "may"})
+            task_id = submitted.structured_content["task_id"]
+            response = await other.call_tool("task_status", {"task_id": task_id})
+    if allowed:
+        assert response.is_error is False
+    else:
+        assert response.meta is not None
+        assert response.meta["warpweft.error"] == "unknown_task"
+        assert response.meta["warpweft.retryable"] is False
+
+
+async def test_legacy_records_without_scope_fail_closed_on_both_surfaces() -> None:
+    app = reports_app()
+    async with app.run(), task_runner() as runner:
+        now = datetime.now(UTC)
+        await runner.store.create(
+            TaskRecord(
+                task_id="legacy",
+                tool="reports__monthly",
+                status="working",
+                created_at=now,
+                last_updated_at=now,
+                ttl_ms=None,
+            )
+        )
+        tasks = TasksClient()
+        server = build_server(app, runner=runner)
+        async with Client(server, mode=MODERN) as plain, Client(server, mode=MODERN, extensions=[tasks]) as native:
+            response = await plain.call_tool("task_status", {"task_id": "legacy"})
+            assert response.meta is not None
+            assert response.meta["warpweft.error"] == "unknown_task"
+            assert response.meta["warpweft.retryable"] is False
+            with pytest.raises(MCPError) as raised:
+                await get_task(native.session, "legacy")
+    assert raised.value.error.code == INVALID_PARAMS
+
+
+async def test_native_argument_binder_fails_closed_when_scope_argument_is_unavailable() -> None:
+    app = reports_app()
+    tenant = app.axis("tenant")
+    binders = {tenant: lambda ctx, params: (params.arguments or {}).get("as_tenant")}
+    async with two_clients(app, axis_binders=binders) as (native, _, plain):
+        submitted = await plain.call_tool("reports__monthly", {"month": "may", "as_tenant": "acme"})
+        task_id = submitted.structured_content["task_id"]
+        allowed = await plain.call_tool("task_status", {"task_id": task_id, "as_tenant": "acme"})
+        assert allowed.is_error is False
+        with pytest.raises(MCPError) as raised:
+            await get_task(native.session, task_id)
+    assert raised.value.error.code == INVALID_PARAMS
