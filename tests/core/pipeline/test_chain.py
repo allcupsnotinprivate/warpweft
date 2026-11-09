@@ -107,6 +107,58 @@ async def test_build_chain_reuses_instance_per_key() -> None:
     assert factory.created == [()]  # one instance, empty scope
 
 
+async def test_empty_scope_key_includes_operation_and_canonical_invocation_scope() -> None:
+    log: list[str] = []
+    factory = RecorderFactory("r", log)
+    store = InMemoryStateStore()
+    chain = build_chain([factory], store, AxisRegistry(), base)
+    unsorted_scope: ScopeKey = (("tenant", "acme"), ("region", "eu"))
+    canonical_scope: ScopeKey = (("region", "eu"), ("tenant", "acme"))
+
+    await chain(ctx().child(scope_key=unsorted_scope))
+    await chain(ctx().child(operation="other", scope_key=canonical_scope))
+    await chain(ctx().child(scope_key=(("tenant", "globex"),)))
+    await chain(ctx().child(scope_key=canonical_scope))  # same operation and scope: reuse
+
+    unit = ("__unit__", factory.identity.uid)
+    assert store.keys() == [
+        (unit, ("__operation__", "other"), *canonical_scope),
+        (unit, ("__operation__", "op"), ("tenant", "globex")),
+        (unit, ("__operation__", "op"), *canonical_scope),
+    ]
+    assert factory.created == [(), (), ()]
+
+
+async def test_empty_scope_key_is_stable_across_factory_instances() -> None:
+    log: list[str] = []
+    store = InMemoryStateStore()
+    first = RecorderFactory("same", log)
+    second = RecorderFactory("same", log)
+
+    await build_chain([first], store, AxisRegistry(), base)(ctx())
+    await build_chain([second], store, AxisRegistry(), base)(ctx())
+    await build_chain([second], store, AxisRegistry(), base)(ctx().child(operation="other"))
+
+    assert first.created == [()]
+    assert second.created == [()]  # only the different operation creates a new link
+
+
+async def test_non_empty_scope_key_excludes_operation_and_invocation_scope() -> None:
+    log: list[str] = []
+    registry = AxisRegistry()
+    registry.register(Axis(name="endpoint", resolver=lambda: "shared"))
+    factory = RecorderFactory("r", log, scope=ScopeSpec(["endpoint"]))
+    store = InMemoryStateStore()
+    chain = build_chain([factory], store, registry, base)
+
+    await chain(ctx().child(scope_key=(("tenant", "acme"),)))
+    await chain(ctx().child(operation="other", scope_key=(("tenant", "globex"),)))
+
+    resolved: ScopeKey = (("endpoint", "shared"),)
+    assert store.keys() == [(("__unit__", factory.identity.uid), *resolved)]
+    assert factory.created == [resolved]
+
+
 async def test_build_chain_resolves_scope_on_every_call() -> None:
     """Changing an axis value between calls must yield a different instance."""
     log: list[str] = []

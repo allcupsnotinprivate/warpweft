@@ -109,6 +109,45 @@ async def test_liveness_tracks_started_state() -> None:
     await container.stop()
 
 
+async def test_health_distinguishes_draining_from_running_and_stopped() -> None:
+    release = anyio.Event()
+
+    class Blocking(AComponent[EmptySettings, None, str]):
+        @invocable
+        async def wait(self) -> str:
+            await release.wait()
+            return "ok"
+
+    reg = Registry()
+    reg.register(Blocking)
+    container = Container.build(reg, {"blocking": {}})
+    assert not (await container.liveness()).is_ok
+    assert not (await container.readiness()).ready
+
+    await container.start()
+    assert (await container.liveness()).is_ok
+    assert (await container.readiness()).ready
+
+    async def call() -> None:
+        await container.invoke("blocking", "wait")
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(call)
+        while container._active_calls == 0:
+            await anyio.lowlevel.checkpoint()
+        tg.start_soon(container.stop)
+        for _ in range(20):
+            await anyio.lowlevel.checkpoint()
+        draining_liveness = (await container.liveness()).is_ok
+        draining_readiness = (await container.readiness()).ready
+        release.set()
+
+    assert draining_liveness
+    assert not draining_readiness
+    assert not (await container.liveness()).is_ok
+    assert not (await container.readiness()).ready
+
+
 async def test_readiness_ok_when_all_required_healthy() -> None:
     reg = Registry()
     reg.register(Healthy)

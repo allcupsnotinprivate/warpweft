@@ -144,6 +144,21 @@ async def test_run_starts_serves_and_stops() -> None:
     assert not container.started  # stopped on exit
 
 
+async def test_sequential_run_calls_create_fresh_containers() -> None:
+    app = fresh_app()
+    async with app.run() as first:
+        first_instance = await app.get(Greeter)
+        assert (await app.invoke("greeter", "greet", whom="one")).value == "hello one x1"
+    assert not first.started
+
+    async with app.run() as second:
+        second_instance = await app.get(Greeter)
+        assert second is not first
+        assert second_instance is not first_instance
+        assert (await app.invoke("greeter", "greet", whom="two")).value == "hello two x1"
+    assert not second.started
+
+
 async def test_typed_passthroughs() -> None:
     app = fresh_app()
     async with app.run():

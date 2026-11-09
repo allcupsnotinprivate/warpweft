@@ -1,7 +1,7 @@
 """Cache link: in-memory LRU + TTL with single-flight.
 
-Sliced per instance by default so isolated consumers never share entries; a
-global cache is an explicit choice. The cache key is
+Sliced per operation and instance by default so isolated consumers never share
+entries or policy settings; a shared cache is an explicit choice. The cache key is
 ``operation + normalized arguments + ScopeKey`` - the ScopeKey in the key means
 even a shared store cannot leak between slices, and argument normalization goes
 through pydantic serialization so it is deterministic regardless of field order.
@@ -152,10 +152,10 @@ class CacheInterceptor:
 class CacheFactory:
     """Factory of the cache link.
 
-    ``state_scope`` defaults to the empty (process) scope: a single store,
-    already isolated per slice by the ScopeKey inside every cache key. Pass an
-    endpoint/instance scope to physically separate stores, or keep the default
-    for a shared cache.
+    ``state_scope`` defaults to the empty scope: the chain isolates each
+    operation and invocation scope, and the ScopeKey inside every cache key
+    prevents entry leaks. Pass an endpoint/instance scope to share the cache
+    across operations and invocation slices, or keep the default for isolation.
     """
 
     settings_model: type[BaseModel] | None = CacheSettings

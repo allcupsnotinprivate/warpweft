@@ -11,7 +11,7 @@ import contextlib
 import socket
 from typing import Any
 
-from _support.mcp_tasks import TasksClient
+from _support.mcp_tasks import CancelTask, TasksClient, UpdateTask, get_task
 import anyio
 import httpx2
 from mcp import Client
@@ -19,7 +19,9 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
+from mcp.shared.exceptions import MCPError
 import mcp.types as mt
+from mcp_types import INVALID_PARAMS
 import pytest
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -29,6 +31,7 @@ from warpweft.core.composition import Registry
 from warpweft.core.context import report_progress
 from warpweft.core.errors import ConfigurationError, FrameworkError
 from warpweft.mcp import Icon, MCPHttpApp, asgi_app, header_binder, run_http, tool
+from warpweft.mcp.tasks_extension import TaskIdParams, UpdateTaskParams
 from warpweft.runtime import App, AxisHandle
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
@@ -80,6 +83,25 @@ def tenant_app() -> tuple[App, AxisHandle]:
     reg.register(Svc)
     app = App(registry=reg)
     holder["tenant"] = app.axis("tenant", default="unset")
+    return app, holder["tenant"]
+
+
+def background_tenant_app(gate: anyio.Event) -> tuple[App, AxisHandle]:
+    holder: dict[str, AxisHandle] = {}
+
+    class Svc(AComponent[EmptySettings, None, str]):
+        name = "svc"
+
+        @tool(background=True)
+        @invocable
+        async def whoami(self) -> str:
+            await gate.wait()
+            return holder["tenant"].current() or "unset"
+
+    reg = Registry()
+    reg.register(Svc)
+    app = App(registry=reg)
+    holder["tenant"] = app.axis("tenant")
     return app, holder["tenant"]
 
 
@@ -194,6 +216,96 @@ async def test_background_tools_run_as_native_tasks(transport: dict[str, Any]) -
         result = await client.call_tool("echo__job", {"n": 21})
     assert result.structured_content == {"result": 42}
     assert len(tasks.handles) == 1
+
+
+async def test_background_task_ownership_across_plain_http_clients() -> None:
+    gate = anyio.Event()
+    app, tenant = background_tenant_app(gate)
+    mcp = asgi_app(app, axis_binders={tenant: header_binder("x-tenant")}, stateless=True, json_response=True)
+    async with (
+        mcp.lifespan(),
+        http_client(mcp, mode="2026-07-28", headers={"x-tenant": "acme"}) as acme,
+        http_client(mcp, mode="2026-07-28", headers={"x-tenant": "beta"}) as beta,
+        http_client(mcp, mode="2026-07-28", headers={"x-tenant": "acme"}, extensions=[TasksClient()]) as acme_native,
+    ):
+        submitted = await acme.call_tool("svc__whoami", {})
+        task_id = submitted.structured_content["task_id"]
+        try:
+            for operation in ("task_status", "task_result", "task_cancel"):
+                denied = await beta.call_tool(operation, {"task_id": task_id})
+                unknown = await beta.call_tool(operation, {"task_id": "unknown"})
+                assert denied.is_error is True
+                assert denied.meta == unknown.meta
+                assert denied.meta is not None
+                assert denied.meta["warpweft.error"] == "unknown_task"
+                assert denied.meta["warpweft.retryable"] is False
+
+            # A denied cancel has no side effect; the owner can still read it.
+            status = await acme.call_tool("task_status", {"task_id": task_id})
+            assert status.structured_content["status"] == "working"
+            native = await get_task(acme_native.session, task_id)
+            assert native.status == "working"  # same owner may cross surfaces
+        finally:
+            gate.set()
+
+        with anyio.fail_after(5):
+            while True:
+                status = await acme.call_tool("task_status", {"task_id": task_id})
+                if status.structured_content["status"] == "completed":
+                    break
+                await anyio.sleep(0.01)
+        result = await acme.call_tool("task_result", {"task_id": task_id})
+    assert result.structured_content == {"result": "acme"}
+
+
+async def test_background_task_ownership_across_native_http_clients() -> None:
+    gate = anyio.Event()
+    app, tenant = background_tenant_app(gate)
+    mcp = asgi_app(app, axis_binders={tenant: header_binder("x-tenant")}, stateless=True, json_response=True)
+    acme_tasks = TasksClient()
+    calls: list[mt.CallToolResult] = []
+
+    async with (
+        mcp.lifespan(),
+        http_client(mcp, mode="2026-07-28", headers={"x-tenant": "acme"}, extensions=[acme_tasks]) as acme,
+        http_client(mcp, mode="2026-07-28", headers={"x-tenant": "beta"}, extensions=[TasksClient()]) as beta,
+        anyio.create_task_group() as tg,
+    ):
+
+        async def run_call() -> None:
+            calls.append(await acme.call_tool("svc__whoami", {}))
+
+        tg.start_soon(run_call)
+        await acme_tasks.started.wait()
+        task_id = acme_tasks.handles[0].task_id
+        try:
+            with pytest.raises(MCPError) as denied_get:
+                await get_task(beta.session, task_id)
+            with pytest.raises(MCPError) as unknown_get:
+                await get_task(beta.session, "unknown")
+            assert denied_get.value.error.code == unknown_get.value.error.code == INVALID_PARAMS
+            assert denied_get.value.error.data == unknown_get.value.error.data
+
+            params = UpdateTaskParams(task_id=task_id, input_responses={"ignored": {}})
+            with pytest.raises(MCPError) as denied_update:
+                await beta.session.send_request(UpdateTask(params=params), mt.EmptyResult)
+            unknown_params = UpdateTaskParams(task_id="unknown", input_responses={"ignored": {}})
+            with pytest.raises(MCPError) as unknown_update:
+                await beta.session.send_request(UpdateTask(params=unknown_params), mt.EmptyResult)
+            assert denied_update.value.error.code == unknown_update.value.error.code == INVALID_PARAMS
+
+            with pytest.raises(MCPError) as denied_cancel:
+                await beta.session.send_request(CancelTask(params=TaskIdParams(task_id=task_id)), mt.EmptyResult)
+            with pytest.raises(MCPError) as unknown_cancel:
+                await beta.session.send_request(CancelTask(params=TaskIdParams(task_id="unknown")), mt.EmptyResult)
+            assert denied_cancel.value.error.code == unknown_cancel.value.error.code == INVALID_PARAMS
+
+            # Neither update nor cancel touched the other tenant's job.
+            assert (await get_task(acme.session, task_id)).status == "working"
+        finally:
+            gate.set()
+    assert calls[0].structured_content == {"result": "acme"}
+    assert acme_tasks.handles[0].task_id == task_id
 
 
 # --- per-request axes from headers ---------------------------------------------

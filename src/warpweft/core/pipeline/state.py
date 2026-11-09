@@ -141,15 +141,19 @@ class InMemoryStateStore:
 
     async def close(self) -> None:
         async with self._lock:
-            if self._closed:
+            if self._closed and not self._entries and not self._pending_stop:
                 return
+            # Closing forbids new work immediately, but a failed/cancelled stop
+            # must leave its resource owned by the store for a later close retry.
             self._closed = True
-            instances = [*self._entries.values(), *self._pending_stop.values()]
-            self._entries.clear()
-            self._pending_stop.clear()
-            self._refs.clear()
-            for instance in instances:
+            for key, instance in list(self._entries.items()):
                 await self._stop(instance)
+                self._entries.pop(key, None)
+                self._refs.pop(id(instance), None)
+            for ident, instance in list(self._pending_stop.items()):
+                await self._stop(instance)
+                self._pending_stop.pop(ident, None)
+                self._refs.pop(ident, None)
 
     async def _evict_instance(self, instance: object) -> None:
         """Stop an evicted instance now, or defer it if a call still pins it."""

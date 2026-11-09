@@ -135,6 +135,20 @@ async def test_config_cache_pins_first_resolution(container: Make) -> None:
     assert resolver.calls[GLOBEX] == 1
 
 
+async def test_restart_clears_config_and_provenance_caches(container: Make) -> None:
+    axes, handles = context_axes("tenant")
+    resolver = _CountingResolver()
+    async with container(ScopedEcho, config={"scoped-echo": {"prefix": "D:"}}, axes=axes, resolver=resolver) as c:
+        with handles["tenant"].use("acme"):
+            assert (await c.invoke("scoped-echo", "echo", text="x")).value == "n1:x"
+        await c.stop()
+        await c.start()
+        assert c._provenance_cache == {}
+        with handles["tenant"].use("acme"):
+            assert (await c.invoke("scoped-echo", "echo", text="x")).value == "n2:x"
+    assert resolver.calls[ACME] == 2
+
+
 async def test_multi_axis_slice_key_is_canonical(container: Make) -> None:
     axes, handles = context_axes("region", "tenant")
 

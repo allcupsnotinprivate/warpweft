@@ -15,6 +15,7 @@ that talk to the same endpoint.
 from collections.abc import Callable, Coroutine, Mapping
 import contextlib
 from dataclasses import dataclass
+from enum import Enum, auto
 import functools
 import logging
 from typing import Any, TypeVar, cast
@@ -67,9 +68,11 @@ from .introspection import (
 from .registry import Registry
 from .wiring import (
     active_links,
+    deadline_scope,
     degradation_interceptor,
     make_base,
     method_factories,
+    overall_deadline,
     validate_degradation,
 )
 
@@ -126,6 +129,14 @@ class _Registration:
     deployment: Mapping[str, Any]
 
 
+class _LifecycleState(Enum):
+    NEW = auto()
+    STARTING = auto()
+    RUNNING = auto()
+    DRAINING = auto()
+    STOPPED = auto()
+
+
 class Container:
     """A configured, runnable set of components and their pipelines."""
 
@@ -176,7 +187,9 @@ class Container:
         self._process_proxies: dict[str, AComponent[Any, Any, Any]] = {}
         self._degraded: set[str] = set()
         self._active_calls = 0
-        self._started = False
+        self._scoped_start_scopes: set[anyio.CancelScope] = set()
+        self._lifecycle_lock = anyio.Lock()
+        self._state = _LifecycleState.NEW
 
     # --- construction --------------------------------------------------------
 
@@ -257,30 +270,78 @@ class Container:
 
     async def start(self) -> None:
         """Start process components in dependency order; scoped ones stay lazy."""
-        if self._started:
-            return
-        for name, reg in self._registrations.items():
-            if reg.descriptor.lifetime is Lifetime.SCOPED:
-                self._scoped_stores[name] = InMemoryStateStore(max_entries=self._scoped_max_entries)
-        try:
-            for layer in self._graph.startup_layers():
-                names = [n for n in layer if self._registrations[n].descriptor.lifetime is Lifetime.PROCESS]
-                async with anyio.create_task_group() as tg:
-                    for name in names:
-                        tg.start_soon(self._start_process, name)
-        except BaseException as exc:
-            await self._stop_process_instances()
-            # A task group reports child failures as a (Base)ExceptionGroup;
-            # surface the underlying error so callers see StartupError directly.
-            raise _first_leaf(exc) from None
+        async with self._lifecycle_lock:
+            if self._state is _LifecycleState.RUNNING:
+                return
+            if self._state is _LifecycleState.DRAINING:
+                raise ConfigurationError("container is draining; finish stop() before restarting")
+            self._state = _LifecycleState.STARTING
+            self._prepare_run()
+            try:
+                for layer in self._graph.startup_layers():
+                    names = [n for n in layer if self._registrations[n].descriptor.lifetime is Lifetime.PROCESS]
+                    async with anyio.create_task_group() as tg:
+                        for name in names:
+                            tg.start_soon(self._start_process, name)
 
-        for name, reg in self._registrations.items():
-            if reg.descriptor.lifetime is Lifetime.PROCESS and name in self._process:
-                config = self._assemble(name, GLOBAL_SCOPE)
-                for method in reg.descriptor.invocables:
-                    self._process_chains[(name, method)] = self._build_chain(self._process[name], name, method, config)
-        self._started = True
-        logger.info("container started: %d component(s), %d degraded", len(self._registrations), len(self._degraded))
+                # Chain construction is part of startup too: a validation or
+                # reflection failure here must clean up already-started instances.
+                for name, reg in self._registrations.items():
+                    if reg.descriptor.lifetime is Lifetime.PROCESS and name in self._process:
+                        config = self._assemble(name, GLOBAL_SCOPE)
+                        for method in reg.descriptor.invocables:
+                            self._process_chains[(name, method)] = self._build_chain(
+                                self._process[name], name, method, config
+                            )
+            except BaseException as exc:
+                try:
+                    await self._cleanup_run()
+                except Exception:
+                    # Cleanup must not replace the startup failure callers need
+                    # to diagnose. Keep the run drainable so stop() can retry it.
+                    logger.exception("container startup cleanup failed")
+                    self._state = _LifecycleState.DRAINING
+                except BaseException:
+                    self._state = _LifecycleState.DRAINING
+                    raise
+                else:
+                    self._state = _LifecycleState.STOPPED
+                # A task group reports child failures as a (Base)ExceptionGroup;
+                # surface the underlying error so callers see StartupError directly.
+                raise _first_leaf(exc) from None
+            self._state = _LifecycleState.RUNNING
+            logger.info(
+                "container started: %d component(s), %d degraded", len(self._registrations), len(self._degraded)
+            )
+
+    def _prepare_run(self) -> None:
+        """Allocate all per-run state; closed stores are never revived."""
+        self._link_store = InMemoryStateStore(max_entries=self._scoped_max_entries)
+        self._scoped_stores = {
+            name: InMemoryStateStore(max_entries=self._scoped_max_entries)
+            for name, reg in self._registrations.items()
+            if reg.descriptor.lifetime is Lifetime.SCOPED
+        }
+        self._clear_transient_state()
+
+    def _clear_transient_state(self) -> None:
+        self._process.clear()
+        self._process_chains.clear()
+        self._process_proxies.clear()
+        self._degraded.clear()
+        self._config_cache.clear()
+        self._provenance_cache.clear()
+        # _active_calls deliberately survives: calls from a forced-drained run
+        # may still be finishing and own paired decrements in their finally blocks.
+
+    async def _cleanup_run(self) -> None:
+        """Stop and drop this run's state only after every cleanup step succeeds."""
+        await self._stop_process_instances()
+        for store in self._scoped_stores.values():
+            await store.close()
+        await self._link_store.close()
+        self._scoped_stores.clear()
+        self._clear_transient_state()
 
     def _invoker_for(self, name: str) -> Callable[..., Coroutine[Any, Any, Outcome[Any]]]:
         """A bound invoker for one component: ``invoke(method, **kwargs)``.
@@ -316,26 +377,36 @@ class Container:
 
     async def stop(self) -> None:
         """Drain active calls, then stop everything in reverse dependency order."""
-        if not self._started:
-            return
-        logger.info("container stopping")
-        with anyio.move_on_after(self._drain_timeout):
-            while self._active_calls > 0:
-                await anyio.lowlevel.checkpoint()  # yield so in-flight calls finish
-        await self._stop_process_instances()
-        for store in self._scoped_stores.values():
-            await store.close()
-        self._scoped_stores.clear()
-        await self._link_store.close()
-        self._started = False
+        async with self._lifecycle_lock:
+            if self._state not in (_LifecycleState.RUNNING, _LifecycleState.DRAINING):
+                return
+            # This transition is synchronous with respect to shutdown: once stop
+            # starts, new invoke/get calls are rejected even while old calls drain.
+            self._state = _LifecycleState.DRAINING
+            logger.info("container stopping")
+            with anyio.move_on_after(self._drain_timeout) as drain:
+                while self._active_calls > 0:
+                    await anyio.lowlevel.checkpoint()  # yield so in-flight calls finish
+            if drain.cancelled_caught:
+                # A lazy start holds its store's creation lock. Cancel just those
+                # admitted startups so close() cannot wait until init_timeout.
+                for scope in tuple(self._scoped_start_scopes):
+                    scope.cancel()
+            # On failure or outer cancellation, remain DRAINING with all unfinished
+            # resources retained. A later stop() resumes instead of leaking them.
+            await self._cleanup_run()
+            self._state = _LifecycleState.STOPPED
 
     async def _stop_process_instances(self) -> None:
         for name in self._graph.shutdown_order():
-            instance = self._process.pop(name, None)
+            instance = self._process.get(name)
             if instance is None:
                 continue
             with anyio.move_on_after(self._drain_timeout):
                 await instance.stop()
+            # Publish removal only after stop returns. A failed/cancelled stop
+            # leaves the instance available to the next cleanup attempt.
+            self._process.pop(name, None)
         self._process_chains.clear()
         self._process_proxies.clear()  # drop proxies around the now-stopped instances
 
@@ -357,24 +428,17 @@ class Container:
         deadline of ``budget`` seconds for the whole call (retries included);
         the per-attempt timeout link still bounds each attempt.
         """
-        if not self._started:
+        if self._state is not _LifecycleState.RUNNING:
             raise ConfigurationError("container is not started")
         reg = self._registration(component)
         if method not in reg.descriptor.invocables:
             raise ConfigurationError(f"component '{component}' has no invocable '{method}'")
 
-        scoped_store: InMemoryStateStore | None = None
-        if reg.descriptor.lifetime is Lifetime.PROCESS:
-            instance = self._process.get(component)
-            if instance is None:
-                raise ComponentUnavailable(f"component '{component}' is degraded")
-            chain = self._process_chains[(component, method)]
-            scope_key: ScopeKey = _process_scope_key(component)
-        else:
-            instance, scope_key = await self._scoped_instance(component)
-            scoped_store = self._scoped_stores[component]
-            chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
-
+        scope_key = (
+            _process_scope_key(component)
+            if reg.descriptor.lifetime is Lifetime.PROCESS
+            else self._axes.resolve(reg.descriptor.scope)
+        )
         ctx = InvocationContext.begin(
             operation=f"{component}.{method}",
             # No ``parent``: invoke takes its id from the explicit arg or the
@@ -385,24 +449,58 @@ class Container:
             scope_key=scope_key,
             arguments=dict(arguments),
         )
-        endpoint = instance.endpoint() or default_endpoint(instance.identity.uid, scope_key)
-        # Pin the scoped instance before the first checkpoint: an LRU eviction
-        # triggered by another tenant must not stop it while this call runs on it.
-        if scoped_store is not None:
-            scoped_store.acquire(instance)
+
+        # Admission is synchronous: stop() can observe this call even if lazy
+        # scoped construction below suspends before the invocation chain exists.
         self._active_calls += 1
+        scoped_store: InMemoryStateStore | None = None
+        scoped_instance: AComponent[Any, Any, Any] | None = None
         try:
+            if reg.descriptor.lifetime is Lifetime.PROCESS:
+                process_instance = self._process.get(component)
+                if process_instance is None:
+                    raise ComponentUnavailable(f"component '{component}' is degraded")
+                instance = process_instance
+                chain = self._process_chains[(component, method)]
+            else:
+                scoped_store = self._scoped_stores[component]
+                created: AComponent[Any, Any, Any] | None = None
+                with anyio.CancelScope() as startup_scope:
+                    self._scoped_start_scopes.add(startup_scope)
+                    try:
+                        async with deadline_scope(ctx):
+                            created, _ = await self._scoped_instance(component, store=scoped_store, scope_key=scope_key)
+                    finally:
+                        self._scoped_start_scopes.discard(startup_scope)
+                if startup_scope.cancel_called:
+                    raise ConfigurationError("container stopped during scoped component startup")
+                instance = cast("AComponent[Any, Any, Any]", created)
+                scoped_instance = instance
+                # Pin before the first post-construction checkpoint: an LRU
+                # eviction must not stop this slice while its call is running.
+                scoped_store.acquire(instance)
+                chain = self._build_chain(instance, component, method, self._assemble(component, scope_key))
+
+            endpoint = instance.endpoint() or default_endpoint(instance.identity.uid, scope_key)
             with use_endpoint(endpoint), use_context(ctx):
                 return await chain(ctx)
         finally:
             self._active_calls -= 1
-            if scoped_store is not None:
-                await scoped_store.release(instance)
+            if scoped_store is not None and scoped_instance is not None:
+                await scoped_store.release(scoped_instance)
 
-    async def _scoped_instance(self, component: str) -> tuple[AComponent[Any, Any, Any], ScopeKey]:
+    async def _scoped_instance(
+        self,
+        component: str,
+        *,
+        store: InMemoryStateStore | None = None,
+        scope_key: ScopeKey | None = None,
+    ) -> tuple[AComponent[Any, Any, Any], ScopeKey]:
         reg = self._registrations[component]
-        scope_key = self._axes.resolve(reg.descriptor.scope)
-        store = self._scoped_stores[component]
+        if scope_key is None:
+            scope_key = self._axes.resolve(reg.descriptor.scope)
+        if store is None:
+            store = self._scoped_stores[component]
 
         async def factory() -> AComponent[Any, Any, Any]:
             # Resolve dependencies inside the factory so it happens only when this
@@ -568,7 +666,7 @@ class Container:
         spec = self._registrations[name].descriptor.invocables[method]
         factories = method_factories(config, spec.policy, self._clock, self._classifier)
         base = make_base(instance, spec)
-        chain = build_chain(factories, self._link_store, self._axes, base)
+        chain = overall_deadline(build_chain(factories, self._link_store, self._axes, base))
         degradation = degradation_interceptor(config, spec.policy, instance, self._classifier)
         if degradation is not None:
             # Fixed position: outside the whole ordered chain (a stub is never
@@ -588,10 +686,16 @@ class Container:
 
     async def liveness(self) -> HealthStatus:
         """Is the process up? Dependencies are not consulted."""
-        return HealthStatus.ok() if self._started else HealthStatus.unhealthy("not started")
+        alive = self._state in (_LifecycleState.RUNNING, _LifecycleState.DRAINING)
+        return HealthStatus.ok() if alive else HealthStatus.unhealthy("not started")
 
     async def readiness(self) -> Readiness:
         """Can the system serve? Required components must be healthy."""
+        if self._state is not _LifecycleState.RUNNING:
+            return Readiness(
+                ready=False,
+                components={name: HealthStatus.unhealthy("not running") for name in self._registrations},
+            )
         own = {name: await self._component_status(name) for name in self._registrations}
         dependencies = {name: reg.descriptor.dependencies for name, reg in self._registrations.items()}
         criticality = {name: reg.descriptor.criticality for name, reg in self._registrations.items()}
@@ -646,7 +750,7 @@ class Container:
         telemetry. Use `invoke` or `proxy` for guarded calls.
         """
         name = ref if isinstance(ref, str) else ref.name
-        if not self._started:
+        if self._state is not _LifecycleState.RUNNING:
             raise ConfigurationError("container is not started")
         reg = self._registration(name)
         if reg.descriptor.lifetime is Lifetime.PROCESS:
@@ -758,7 +862,7 @@ class Container:
 
     @property
     def started(self) -> bool:
-        return self._started
+        return self._state is _LifecycleState.RUNNING
 
     def is_degraded(self, name: str) -> bool:
         return name in self._degraded

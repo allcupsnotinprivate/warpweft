@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import logging
 from typing import Protocol
 from uuid import uuid4
 
@@ -33,7 +34,11 @@ import mcp.types as mt
 from mcp_types import TaskStatus
 from pydantic import BaseModel
 
+from warpweft.core.axes import ScopeKey
 from warpweft.core.clock import Clock, SystemClock
+from warpweft.core.errors import PermanentError
+
+logger = logging.getLogger(__name__)
 
 #: Default retention for a finished task's state and result, in milliseconds,
 #: measured from when it settled. A running task never expires.
@@ -41,6 +46,38 @@ DEFAULT_TTL_MS = 5 * 60 * 1000
 
 #: A task in a terminal state never changes again.
 TERMINAL: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled"})
+
+
+class TaskAlreadyExistsError(PermanentError):
+    """A live task with the same id already exists in the store."""
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(f"task '{task_id}' already exists")
+        self.task_id = task_id
+
+
+class InvalidTaskTransitionError(PermanentError):
+    """A store update requested a transition outside the task state machine."""
+
+    def __init__(self, task_id: str, current: TaskStatus, requested: TaskStatus) -> None:
+        super().__init__(f"task '{task_id}' cannot transition from {current} to {requested}")
+        self.task_id = task_id
+        self.current = current
+        self.requested = requested
+
+
+@dataclass(frozen=True, slots=True)
+class TaskScope:
+    """The owner of a task: a server namespace plus canonical axis values."""
+
+    namespace: str
+    axes: ScopeKey = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "axes", tuple(sorted(self.axes)))
+
+
+_LOCAL_SCOPE = TaskScope("local")
 
 
 @dataclass(frozen=True)
@@ -62,6 +99,9 @@ class TaskRecord:
     status_message: str | None = None
     #: The final ``tools/call`` payload, retained for ``task_result``.
     result: mt.CallToolResult | None = None
+    #: Exact owner required by every server-side read/update/cancel. ``None``
+    #: denotes a legacy record, which is deliberately not a wildcard.
+    scope: TaskScope | None = None
 
 
 class TaskStatusView(BaseModel):
@@ -85,9 +125,22 @@ class TaskStore(Protocol):
     async so a backing store can be remote. ``get`` returns ``None`` for an
     unknown or expired id; expiry follows `TaskRecord` (``ttl_ms`` after the
     task settled, never while it runs).
+
+    Custom stores must make ``create`` and ``update`` atomic. ``create`` raises
+    `TaskAlreadyExistsError` for a live duplicate without overwriting it, but
+    may replace an expired record. ``update`` permits working progress and
+    working-to-terminal transitions only. Unknown/expired ids and every update
+    to a terminal record are no-ops; other transitions raise
+    `InvalidTaskTransitionError`. The first linearized terminal write wins, and
+    ignored writes must not change the record, its timestamp, or its TTL. Every
+    update preserves ``record.scope``.
+    A retryable backend outage should be raised as ``TransientError`` so both
+    MCP surfaces can give the caller accurate retry guidance.
     """
 
-    async def create(self, record: TaskRecord) -> None: ...
+    async def create(self, record: TaskRecord) -> None:
+        """Atomically insert a new record, rejecting a live duplicate."""
+        ...
 
     async def get(self, task_id: str) -> TaskRecord | None: ...
 
@@ -99,7 +152,7 @@ class TaskStore(Protocol):
         status_message: str | None = None,
         result: mt.CallToolResult | None = None,
     ) -> None:
-        """Advance a task's state. A no-op if the id is unknown."""
+        """Atomically advance a task according to the `TaskStore` state machine."""
         ...
 
 
@@ -118,6 +171,11 @@ class InMemoryTaskStore:
 
     async def create(self, record: TaskRecord) -> None:
         async with self._lock:
+            existing = self._records.get(record.task_id)
+            if existing is not None:
+                if not self._expired(existing):
+                    raise TaskAlreadyExistsError(record.task_id)
+                del self._records[record.task_id]
             self._records[record.task_id] = record
 
     async def get(self, task_id: str) -> TaskRecord | None:
@@ -148,6 +206,12 @@ class InMemoryTaskStore:
                 # silently extend a task's lifetime.
                 del self._records[task_id]
                 return
+            if record.status in TERMINAL:
+                # Terminal records are immutable, including their settlement
+                # timestamp: an ignored write must never extend retention.
+                return
+            if record.status != "working" or status == "input_required":
+                raise InvalidTaskTransitionError(task_id, record.status, status)
             self._records[task_id] = replace(
                 record,
                 status=status,
@@ -201,14 +265,22 @@ class TaskRunner:
     def store(self) -> TaskStore:
         return self._store
 
-    async def start(self, tool: str, job: TaskJob, *, ttl_ms: int | None) -> TaskRecord:
+    async def start(
+        self,
+        tool: str,
+        job: TaskJob,
+        *,
+        ttl_ms: int | None,
+        scope: TaskScope | None = None,
+    ) -> TaskRecord:
         """Mint an id, durably create the task, then spawn it.
 
         The record is persisted before we return so a poll that races the
         spawn always finds the task. The cancel scope is registered *here*,
         synchronously before ``start_soon``, so a ``cancel`` that arrives before
         the background job has actually started running is still honoured (there
-        is no window where the scope is missing).
+        is no window where the scope is missing). ``scope`` defaults to the
+        single-owner local scope; servers normally pass their request-derived scope.
         """
         now = self._clock.now()
         record = TaskRecord(
@@ -218,11 +290,12 @@ class TaskRunner:
             created_at=now,
             last_updated_at=now,
             ttl_ms=ttl_ms,
+            scope=scope or _LOCAL_SCOPE,
         )
         await self._store.create(record)
-        scope = anyio.CancelScope()
-        self._scopes[record.task_id] = scope
-        self._tg.start_soon(self._run, record.task_id, job, scope)
+        cancel_scope = anyio.CancelScope()
+        self._scopes[record.task_id] = cancel_scope
+        self._tg.start_soon(self._run, record.task_id, job, cancel_scope)
         return record
 
     async def cancel(self, task_id: str) -> None:
@@ -238,27 +311,47 @@ class TaskRunner:
     async def _run(self, task_id: str, job: TaskJob, scope: anyio.CancelScope) -> None:
         try:
             result: mt.CallToolResult | None = None
-            with scope:
-                result = await job(task_id)
-            # The terminal write is shielded so a cancel that races job
-            # completion can neither interrupt the write nor discard a result
-            # the job already produced. ``result is None`` means the job's own
-            # await was cancelled mid-flight (the scope swallowed it).
-            with anyio.CancelScope(shield=True):
-                if result is None:
-                    # Overwrite any stale in-flight progress message.
-                    await self._store.update(task_id, status="cancelled", status_message="cancelled")
-                else:
-                    status: TaskStatus = "failed" if result.is_error else "completed"
-                    await self._store.update(task_id, status=status, result=result)
-        except Exception as exc:
-            # ``job`` is expected to turn every failure into an error result, so
-            # this is a last-resort guard: a bug here must not tear down the
-            # shared nursery and its sibling tasks.
-            with anyio.CancelScope(shield=True):
-                await self._store.update(task_id, status="failed", status_message=str(exc))
+            try:
+                with scope:
+                    result = await job(task_id)
+            except Exception as exc:
+                # The job normally turns failures into an error result. This is
+                # a last-resort fallback for a job bug, and it is deliberately
+                # separate from terminal persistence below: a store outage is
+                # not evidence that the job failed.
+                with anyio.CancelScope(shield=True):
+                    await self._store_terminal(task_id, "failed", status_message=str(exc))
+            else:
+                # Shield the terminal write so cancellation racing completion
+                # cannot discard a result the job already produced. ``None``
+                # means the job's own scope was cancelled mid-flight.
+                with anyio.CancelScope(shield=True):
+                    if result is None:
+                        await self._store_terminal(task_id, "cancelled", status_message="cancelled")
+                    else:
+                        status: TaskStatus = "failed" if result.is_error else "completed"
+                        await self._store_terminal(task_id, status, result=result)
         finally:
             self._scopes.pop(task_id, None)
+
+    async def _store_terminal(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        status_message: str | None = None,
+        result: mt.CallToolResult | None = None,
+    ) -> None:
+        """Contain every persistence failure so sibling jobs keep running."""
+        try:
+            await self._store.update(
+                task_id,
+                status=status,
+                status_message=status_message,
+                result=result,
+            )
+        except Exception:
+            logger.exception("failed to persist terminal state %s for task %s", status, task_id)
 
 
 @asynccontextmanager

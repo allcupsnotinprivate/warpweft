@@ -107,6 +107,31 @@ async def test_close_stops_everything_and_forbids_use() -> None:
         await store.get_or_create(key("c"), Resource)
 
 
+async def test_close_failure_retains_the_resource_for_a_retry() -> None:
+    class FlakyResource(Resource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_calls = 0
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise RuntimeError("stop failed")
+            await super().stop()
+
+    store = InMemoryStateStore()
+    resource = await store.get_or_create(key("k"), FlakyResource)
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        await store.close()
+    assert len(store) == 1
+
+    await store.close()
+    assert resource.stop_calls == 2
+    assert resource.stopped
+    assert len(store) == 0
+
+
 async def test_max_entries_validated() -> None:
     with pytest.raises(ValueError, match="positive"):
         InMemoryStateStore(max_entries=0)

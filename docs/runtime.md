@@ -108,9 +108,9 @@ with app.correlation(request_id):  # every call in the block inherits it
 fast = app.proxy(Weather, budget=1.5)  # budget bound to every proxy call
 ```
 
-`budget` is an overall deadline in seconds (retries included); the per-attempt
-timeout link still bounds each attempt. `correlation_id` defaults to the
-ambient one, then a fresh id.
+`budget` is an overall deadline in seconds (lazy scoped initialization and
+retries included); the per-attempt timeout link still bounds each attempt.
+`correlation_id` defaults to the ambient one, then a fresh id.
 
 ## Lifecycle
 

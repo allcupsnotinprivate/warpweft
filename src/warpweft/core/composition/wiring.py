@@ -6,10 +6,12 @@ effective policy restricts which links are allowed, and a link is active only
 when it is implemented and has settings.
 """
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 import inspect
 from typing import Any, cast, get_type_hints
 
+import anyio
 from pydantic import BaseModel
 
 from warpweft.core.clock import Clock
@@ -18,7 +20,7 @@ from warpweft.core.component.invocable import InvocableSpec
 from warpweft.core.component.policy import Criticality, EffectivePolicy
 from warpweft.core.component.settings import POLICY_FIELD
 from warpweft.core.context import InvocationContext
-from warpweft.core.errors import ConfigurationError, ErrorClassifier
+from warpweft.core.errors import ConfigurationError, DeadlineExceeded, ErrorClassifier
 from warpweft.core.outcome import Outcome
 from warpweft.core.pipeline.builtin.degradation import DegradationInterceptor, DegradationSettings
 from warpweft.core.pipeline.chain import DEFAULT_ORDER
@@ -99,6 +101,53 @@ def degradation_interceptor(
     if settings is None:
         return None
     return DegradationInterceptor(cast(DegradationSettings, settings), instance.stub, classifier)
+
+
+@asynccontextmanager
+async def deadline_scope(ctx: InvocationContext) -> AsyncIterator[None]:
+    """Bound one invocation stage by the shared overall deadline.
+
+    The container uses this for lazy scoped initialization as well as the policy
+    chain, so startup consumes the caller's budget instead of preceding it.
+    """
+    if ctx.deadline is None:
+        yield
+        return
+    if ctx.expired():
+        raise DeadlineExceeded(f"deadline exhausted before '{ctx.operation}'")
+
+    remaining = cast("float", ctx.remaining())  # narrowed by the deadline check above
+    with anyio.move_on_after(remaining) as scope:
+        try:
+            yield
+        except Exception as exc:
+            # An inner attempt timeout can win the race with this guard's
+            # cancellation. At the overall expiry it is still the overall
+            # deadline that callers should observe. AnyIO cancellation from
+            # an outer scope is a BaseException and propagates untouched.
+            if scope.cancelled_caught or ctx.expired():
+                raise DeadlineExceeded(f"deadline exhausted during '{ctx.operation}'") from exc
+            raise
+    if scope.cancelled_caught or ctx.expired():
+        raise DeadlineExceeded(f"deadline exhausted after '{ctx.operation}'")
+
+
+def overall_deadline(chain: Next) -> Next:
+    """Enforce the invocation deadline around the complete ordered policy chain.
+
+    This fixed-position guard deliberately has no configuration or policy state.
+    Retry and timeout links remain deadline-aware, but neither can bound a chain
+    in which they are absent. The post-check also rejects a result produced after
+    the deadline by user code that returned without another cancellation
+    checkpoint.
+    """
+
+    async def guarded(ctx: InvocationContext) -> Outcome[Any]:
+        async with deadline_scope(ctx):
+            outcome = await chain(ctx)
+        return outcome
+
+    return guarded
 
 
 def make_base(instance: object, spec: InvocableSpec) -> Next:

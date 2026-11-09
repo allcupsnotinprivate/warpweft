@@ -52,13 +52,21 @@ def build_chain(
     chain object serves all slices.
 
     Store keys are namespaced with the factory uid: different links with
-    identical (e.g. empty) scopes must not collide in a shared store.
+    identical scopes must not collide in a shared store. Empty-scope links
+    also include the operation and invocation scope so independently
+    configured methods and slices never reuse each other's settings.
+    Endpoint-scoped links deliberately omit both to preserve endpoint sharing.
     """
 
     def bind(inner: Next, factory: InterceptorFactory) -> Next:
         async def call(ctx: InvocationContext) -> Outcome[Any]:
             scope: ScopeKey = registry.resolve(factory.state_scope)
-            store_key: ScopeKey = (("__unit__", factory.identity.uid), *scope)
+            unit = ("__unit__", factory.identity.uid)
+            if factory.state_scope:
+                store_key: ScopeKey = (unit, *scope)
+            else:
+                invocation_scope: ScopeKey = tuple(sorted(ctx.scope_key))
+                store_key = (unit, ("__operation__", ctx.operation), *invocation_scope)
             instance = await store.get_or_create(store_key, lambda: factory.create(scope))
             return await instance.call(inner, ctx)
 

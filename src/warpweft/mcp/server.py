@@ -19,6 +19,7 @@ from fnmatch import fnmatchcase
 import inspect
 import json
 from typing import Any, TypedDict, Unpack, cast
+from uuid import uuid4
 
 from mcp.server.lowlevel.server import Server
 from mcp.server.stdio import stdio_server
@@ -29,13 +30,22 @@ from pydantic import ValidationError
 
 from warpweft.core.component import InvocableSpec, describe
 from warpweft.core.context import use_progress_sink
-from warpweft.core.errors import FrameworkError
+from warpweft.core.errors import ConfigurationError, FrameworkError
 from warpweft.runtime import App, AxisHandle
 
 from .errors import error_result
 from .schema import tool_input_schema
-from .tasks import DEFAULT_TTL_MS, TERMINAL, TaskRecord, TaskRunner, TaskStatusView, status_view, task_runner
-from .tasks_extension import create_task_result, supports_native_tasks
+from .tasks import (
+    DEFAULT_TTL_MS,
+    TERMINAL,
+    TaskRecord,
+    TaskRunner,
+    TaskScope,
+    TaskStatusView,
+    status_view,
+    task_runner,
+)
+from .tasks_extension import create_task_result, supports_native_tasks, task_backend_error
 from .tasks_extension import install as install_tasks_extension
 from .tool import Icon, ToolMeta, is_tool, tool_meta
 
@@ -97,6 +107,9 @@ class ServerOptions(TypedDict, total=False):
     #: around ``runner.start``, so the job inherits it); ``None`` from the
     #: binder leaves the axis to its default/required rule.
     axis_binders: Mapping[AxisHandle, AxisBinder] | None
+    #: Namespace isolating tasks created by this server. Defaults to a random
+    #: value per built server; shared-store workers must configure one stable value.
+    task_namespace: str
 
 
 #: Names of the shared built-in tools that drive background execution. They are
@@ -497,6 +510,31 @@ def _bind_axes(
             stack.enter_context(handle.use(value))
 
 
+class _TaskScopeProvider:
+    """Resolve the same request-derived owner on plain and native task calls."""
+
+    def __init__(self, binders: Mapping[AxisHandle, AxisBinder], namespace: str) -> None:
+        self._binders = binders
+        self._namespace = namespace
+
+    def bind(self, stack: contextlib.ExitStack, ctx: Any, params: mt.CallToolRequestParams) -> None:
+        _bind_axes(stack, self._binders, ctx, params)
+
+    def snapshot(self) -> TaskScope:
+        axes: list[tuple[str, str]] = []
+        for handle in self._binders:
+            value = handle.current()
+            if value is None:
+                raise ConfigurationError(f"axis '{handle.name}' is required to own a background task")
+            axes.append((handle.name, value))
+        return TaskScope(self._namespace, tuple(axes))
+
+    def scope(self, ctx: Any, params: mt.CallToolRequestParams) -> TaskScope:
+        with contextlib.ExitStack() as stack:
+            self.bind(stack, ctx, params)
+            return self.snapshot()
+
+
 def _check_icons(icons: Sequence[Any], owner: str) -> None:
     """Catch icons that slipped past typing (an action's ``icons`` attribute, say) before a client lists them."""
     bad = [icon for icon in icons if not isinstance(icon, Icon)]
@@ -548,6 +586,8 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
     bindings = _served_tools(app, options, has_runner=runner is not None)
     classes = {name: app.registry.get(name) for name in app.registry.names()}
     binders = dict(options.get("axis_binders") or {})
+    namespace = options.get("task_namespace")
+    scope_provider = _TaskScopeProvider(binders, uuid4().hex if namespace is None else namespace)
     confirm_destructive = options.get("confirm_destructive", False)
     background = [b for b in bindings.values() if b.meta.background]
     task_tools = _task_tool_descriptors(background) if background else []
@@ -560,7 +600,11 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
 
     async def on_call_tool(ctx: Any, params: mt.CallToolRequestParams) -> CallToolResponse:
         if params.name in _RESERVED_NAMES:
-            return await _handle_task_tool(runner, bindings, params)
+            try:
+                scope = scope_provider.scope(ctx, params)
+            except Exception as exc:
+                return error_result(exc)
+            return await _handle_task_tool(runner, bindings, params, scope=scope)
 
         binding = bindings.get(params.name)
         if binding is None:
@@ -590,13 +634,20 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
         # transport-level failure.
         with contextlib.ExitStack() as axes:
             try:
-                _bind_axes(axes, binders, ctx, params)
+                scope_provider.bind(axes, ctx, params)
             except Exception as exc:
                 return error_result(exc)
 
             if binding.meta.background and runner is not None:  # runner presence guaranteed at build time
-                record = await _start_task(app, runner, binding, kwargs)
-                return create_task_result(record) if supports_native_tasks(ctx) else _submit_result(record)
+                native = supports_native_tasks(ctx)
+                try:
+                    scope = scope_provider.snapshot()
+                    record = await _start_task(app, runner, binding, kwargs, scope=scope)
+                except Exception as exc:
+                    if native:
+                        raise task_backend_error(exc, "create") from exc
+                    return error_result(exc)
+                return create_task_result(record) if native else _submit_result(record)
 
             async def forward_progress(progress: float, total: float | None, message: str | None) -> None:
                 # Best-effort: a failed notification must never fail the call.
@@ -630,11 +681,18 @@ def build_server(app: App, *, runner: TaskRunner | None = None, **options: Unpac
         on_call_tool=cast(Any, on_call_tool),
     )
     if background and runner is not None:
-        install_tasks_extension(server, runner)
+        install_tasks_extension(server, runner, scope_provider=scope_provider)
     return server
 
 
-async def _start_task(app: App, runner: TaskRunner, binding: ToolBinding, kwargs: dict[str, Any]) -> TaskRecord:
+async def _start_task(
+    app: App,
+    runner: TaskRunner,
+    binding: ToolBinding,
+    kwargs: dict[str, Any],
+    *,
+    scope: TaskScope,
+) -> TaskRecord:
     """Start a background job; the record is durable before this returns.
 
     The stored result is what the call would have returned inline, whichever
@@ -656,7 +714,7 @@ async def _start_task(app: App, runner: TaskRunner, binding: ToolBinding, kwargs
             return error_result(exc)
         return _success_result(binding, outcome)
 
-    return await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS)
+    return await runner.start(binding.name, job, ttl_ms=DEFAULT_TTL_MS, scope=scope)
 
 
 def _submit_result(record: TaskRecord) -> mt.CallToolResult:
@@ -667,7 +725,11 @@ def _submit_result(record: TaskRecord) -> mt.CallToolResult:
 
 
 async def _handle_task_tool(
-    runner: TaskRunner | None, bindings: Mapping[str, ToolBinding], params: mt.CallToolRequestParams
+    runner: TaskRunner | None,
+    bindings: Mapping[str, ToolBinding],
+    params: mt.CallToolRequestParams,
+    *,
+    scope: TaskScope,
 ) -> mt.CallToolResult:
     """Serve task_status / task_result / task_cancel against the runner's store."""
     if runner is None:
@@ -678,8 +740,11 @@ async def _handle_task_tool(
     if not isinstance(task_id, str) or not task_id:
         return _refusal("task_id is required", code="invalid_arguments")
 
-    record = await runner.store.get(task_id)
-    if record is None:
+    try:
+        record = await runner.store.get(task_id)
+    except Exception as exc:
+        return error_result(exc)
+    if record is None or record.scope != scope:
         return _refusal(f"unknown task '{task_id}'", code="unknown_task")
 
     if params.name == _TASK_STATUS:
@@ -689,7 +754,10 @@ async def _handle_task_tool(
         await runner.cancel(task_id)
         # Report the state as it stands; the job settles to ``cancelled``
         # asynchronously as its scope unwinds.
-        fresh = await runner.store.get(task_id)
+        try:
+            fresh = await runner.store.get(task_id)
+        except Exception as exc:
+            return error_result(exc)
         return _status_result(status_view(fresh or record))
 
     # _TASK_RESULT: the stored payload is already typed and secret-masked.
