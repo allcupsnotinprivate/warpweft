@@ -40,7 +40,9 @@ class InterceptorFactory(Protocol):
 
     identity: Identity
 
-    #: Axes this link's state is sliced along. Empty means process-wide.
+    #: Axes this link's state is sliced along. Empty means one instance per
+    #: operation and invocation scope, keeping independently configured calls
+    #: isolated in the shared store.
     state_scope: ScopeSpec
 
     def create(self, key: ScopeKey) -> Interceptor:
