@@ -70,6 +70,7 @@ from .wiring import (
     degradation_interceptor,
     make_base,
     method_factories,
+    overall_deadline,
     validate_degradation,
 )
 
@@ -568,7 +569,7 @@ class Container:
         spec = self._registrations[name].descriptor.invocables[method]
         factories = method_factories(config, spec.policy, self._clock, self._classifier)
         base = make_base(instance, spec)
-        chain = build_chain(factories, self._link_store, self._axes, base)
+        chain = overall_deadline(build_chain(factories, self._link_store, self._axes, base))
         degradation = degradation_interceptor(config, spec.policy, instance, self._classifier)
         if degradation is not None:
             # Fixed position: outside the whole ordered chain (a stub is never

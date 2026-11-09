@@ -562,10 +562,10 @@ async def test_bad_arity_falls_back_to_kwargs_and_raises_the_real_error() -> Non
     assert seen["dep.fetch"] == {}  # signature.bind failed -> kwargs-only (empty), positionals dropped
 
 
-async def test_dependency_call_does_not_inherit_an_unenforceable_deadline() -> None:
-    # The raw (link-less) dependency path enforces no deadline, so it does not
-    # populate one: ctx.deadline is None on the dep span rather than a dead field
-    # that would mislead a span_enricher/reader. The call still runs to completion.
+async def test_dependency_call_does_not_inherit_caller_deadline() -> None:
+    # A caller budget applies to the invocation as a whole, but it is not inherited
+    # as an independent budget by the raw dependency path. When the nested call
+    # completes within the caller's budget, its own span still has no deadline.
     seen: dict[str, float | None] = {}
 
     def enrich(span: Any, ctx: InvocationContext, outcome: Any, exc: Any) -> None:
@@ -576,7 +576,7 @@ async def test_dependency_call_does_not_inherit_an_unenforceable_deadline() -> N
 
         @invocable
         async def go(self) -> str:
-            await anyio.sleep(0.05)  # outlives the tiny budget below
+            await anyio.sleep(0.05)
             return "done"
 
     class Caller(AComponent[EmptySettings, None, str]):
@@ -589,10 +589,10 @@ async def test_dependency_call_does_not_inherit_an_unenforceable_deadline() -> N
 
     container = Container.build(registry_of(Slow, Caller), {"slow": {}, "caller": {}}, span_enricher=enrich)
     await container.start()
-    outcome = await container.invoke("caller", "run", budget=0.001)
+    outcome = await container.invoke("caller", "run", budget=1.0)
     await container.stop()
-    assert seen["slow.go"] is None  # deadline not populated (it could not be enforced)
-    assert outcome.value == "done"  # and nothing was cut off
+    assert seen["slow.go"] is None  # the dependency has no deadline of its own
+    assert outcome.value == "done"
 
 
 async def test_correlation_id_propagates_invoke_to_nested_deps() -> None:
